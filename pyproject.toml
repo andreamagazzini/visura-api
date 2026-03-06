@@ -46,10 +46,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/menimenocchio/visura-api"
-Repository = "https://github.com/menimenocchio/visura-api"
-Issues = "https://github.com/menimenocchio/visura-api/issues"
-Changelog = "https://github.com/menimenocchio/visura-api/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/zornade/visura-api"
+Repository = "https://github.com/zornade/visura-api"
+Issues = "https://github.com/zornade/visura-api/issues"
+Changelog = "https://github.com/zornade/visura-api/blob/main/CHANGELOG.md"
 
 [tool.black]
 line-length = 120

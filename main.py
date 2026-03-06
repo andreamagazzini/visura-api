@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import signal
 import sys
 import json
 import os
@@ -13,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from contextlib import asynccontextmanager
-from utils import login, run_visura, logout, extract_all_sezioni, run_visura_immobile
+from utils import login, run_visura, logout, extract_all_sezioni, run_visura_immobile, PageLogger
 from pydantic import BaseModel, Field, validator
 
 # Carica variabili d'ambiente da .env
@@ -115,7 +114,9 @@ class BrowserManager:
         try:
             playwright = await async_playwright().start()
             self.browser = await playwright.chromium.launch(
-                headless=True,  
+                headless=True,
+                handle_sigint=False,   # Non chiudere Chromium su Ctrl+C — gestiamo noi il logout
+                handle_sigterm=False,  # Idem per SIGTERM
                 args=[
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
@@ -137,6 +138,14 @@ class BrowserManager:
     async def login(self):
         """Esegue il login nella prima tab"""
         try:
+            # Chiudi la vecchia pagina prima di crearne una nuova
+            if self.auth_page and not self.auth_page.is_closed():
+                try:
+                    await self.auth_page.close()
+                    logger.info("Vecchia pagina di autenticazione chiusa")
+                except Exception as e:
+                    logger.warning(f"Errore chiudendo vecchia pagina: {e}")
+            
             page = await self.context.new_page()
             await login(page)
             self.auth_page = page
@@ -190,7 +199,7 @@ class BrowserManager:
         try:
             logger.info("Eseguendo refresh della sessione...")
             
-            await self.auth_page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=30000)
+            await self.auth_page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=30000)
             await self.auth_page.wait_for_load_state("networkidle", timeout=15000)
             
             try:
@@ -224,12 +233,12 @@ class BrowserManager:
                 return False
             
             current_url = self.auth_page.url
-            if "sister.agenziaentrate.gov.it" not in current_url:
+            if "agenziaentrate.gov.it" not in current_url or "sister" not in current_url:
                 logger.warning(f"Non siamo più nel portale SISTER - URL: {current_url}")
                 return False
             
             if "SceltaServizio.do" not in current_url:
-                await self.auth_page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=30000)
+                await self.auth_page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=30000)
                 await self.auth_page.wait_for_load_state("networkidle", timeout=15000)
             
             provincia_options = await self.auth_page.locator("select[name='listacom'] option").count()
@@ -244,14 +253,88 @@ class BrowserManager:
             logger.error(f"Errore nella verifica della sessione: {e}")
             return False
     
+    async def _try_session_recovery(self) -> bool:
+        """Tenta di recuperare la sessione SISTER senza rifare il login SPID.
+        Naviga direttamente alla pagina di scelta servizio e verifica se è ancora valida."""
+        try:
+            if not self.auth_page or self.auth_page.is_closed():
+                return False
+            
+            recovery_logger = PageLogger("recovery")
+            logger.info("Tentativo di recupero sessione SISTER senza SPID...")
+            
+            # Prova a navigare direttamente alla pagina Visure
+            await self.auth_page.goto(
+                "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_",
+                timeout=30000
+            )
+            await self.auth_page.wait_for_load_state("networkidle", timeout=15000)
+            await recovery_logger.log(self.auth_page, "goto_scelta_servizio")
+            
+            current_url = self.auth_page.url
+            content = await self.auth_page.content()
+            
+            # Se siamo stati reindirizzati al login → sessione scaduta davvero
+            if "iampe.agenziaentrate.gov.it" in current_url or "Login" in current_url:
+                logger.info("Sessione SISTER scaduta, serve login SPID completo")
+                return False
+            
+            # Se c'è errore di sessione bloccata
+            if "Utente gia' in sessione" in content or "error_locked.jsp" in current_url:
+                logger.warning("Utente già in sessione, serve login SPID completo")
+                return False
+            
+            # Verifica che ci siano le province (segno che la sessione funziona)
+            provincia_options = await self.auth_page.locator("select[name='listacom'] option").count()
+            if provincia_options > 1:
+                logger.info(f"Sessione SISTER recuperata! {provincia_options-1} province disponibili")
+                self.authenticated = True
+                self.last_login_time = datetime.now()
+                return True
+            
+            # Se la pagina è quella giusta ma senza province, proviamo il percorso completo
+            if "agenziaentrate.gov.it" in current_url and "sister" in current_url:
+                try:
+                    await self.auth_page.get_by_role("button", name="Conferma").click(timeout=5000)
+                    await recovery_logger.log(self.auth_page, "conferma")
+                    await self.auth_page.get_by_role("link", name="Consultazioni e Certificazioni").click(timeout=5000)
+                    await recovery_logger.log(self.auth_page, "consultazioni")
+                    await self.auth_page.get_by_role("link", name="Visure catastali").click(timeout=5000)
+                    await recovery_logger.log(self.auth_page, "visure_catastali")
+                    await self.auth_page.get_by_role("link", name="Conferma Lettura").click(timeout=5000)
+                    await recovery_logger.log(self.auth_page, "conferma_lettura")
+                    
+                    logger.info("Sessione SISTER recuperata tramite navigazione interna")
+                    self.authenticated = True
+                    self.last_login_time = datetime.now()
+                    return True
+                except Exception as e:
+                    logger.warning(f"Navigazione interna fallita: {e}")
+                    await recovery_logger.log(self.auth_page, "navigazione_fallita")
+                    return False
+            
+            await recovery_logger.log(self.auth_page, "stato_sconosciuto")
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Recupero sessione fallito: {e}")
+            return False
+
     async def _ensure_authenticated(self):
-        """Assicura che il sistema sia autenticato, ri-autentica se necessario"""
+        """Assicura che il sistema sia autenticato, ri-autentica se necessario.
+        Prima tenta il recupero sessione senza SPID, poi fallback a login completo."""
         if not self.authenticated or not await self._check_session_validity():
-            logger.info("Sessione non valida, ri-autenticando...")
+            # Step 1: tenta recupero sessione senza SPID
+            if await self._try_session_recovery():
+                logger.info("Sessione recuperata senza login SPID")
+                return
+            
+            # Step 2: fallback a login SPID completo
+            logger.info("Sessione non recuperabile, login SPID completo...")
             try:
                 await self.login()
                 await self.start_keep_alive()
-                logger.info("Re-autenticazione completata")
+                logger.info("Re-autenticazione SPID completata")
             except Exception as e:
                 logger.error(f"Errore nella re-autenticazione: {e}")
                 raise AuthenticationError(f"Re-authentication failed: {e}") from e
@@ -483,41 +566,21 @@ def get_visura_service() -> VisuraService:
     return visura_service
 
 # Signal handler per shutdown graceful
-async def shutdown_handler(sig, frame):
-    """Handler per signal di shutdown"""
-    logger.info(f"Ricevuto signal {sig}, iniziando shutdown graceful...")
-    try:
-        if visura_service:
-            await visura_service.graceful_shutdown()
-        logger.info("Shutdown graceful completato, uscita...")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Errore durante shutdown graceful: {e}")
-        sys.exit(1)
-
-def setup_signal_handlers():
-    """Configura i signal handlers per shutdown graceful"""
-    def signal_handler(sig, frame):
-        logger.info(f"Signal {sig} ricevuto, avviando shutdown graceful...")
-        if visura_service:
-            asyncio.create_task(visura_service.graceful_shutdown())
-        logger.info("Shutdown graceful schedulato")
-        sys.exit(0)
-    
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    logger.info("Signal handlers configurati per SIGTERM e SIGINT")
+# Nota: NON usiamo signal handler custom perché sys.exit() uccide il processo
+# prima che il logout async possa completare. Uvicorn gestisce già SIGINT/SIGTERM
+# e passa per il lifespan shutdown dove il logout viene eseguito correttamente.
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     global visura_service
-    setup_signal_handlers()
+    PageLogger.reset_session()  # Nuova sessione di log per ogni avvio
     visura_service = VisuraService()
     await visura_service.initialize()
     logger.info("Servizio visure avviato")
     yield
-    # Shutdown
+    # Shutdown — uvicorn arriva qui dopo SIGINT/SIGTERM
+    logger.info("Shutdown in corso, eseguendo logout...")
     if visura_service:
         await visura_service.graceful_shutdown()
     logger.info("Servizio visure fermato con graceful shutdown")

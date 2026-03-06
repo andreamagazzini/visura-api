@@ -2,99 +2,138 @@
 
 [![Licenza](https://img.shields.io/badge/Licenza-GPL%20v3-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-green.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.104-009688.svg)](https://fastapi.tiangolo.com/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688.svg)](https://fastapi.tiangolo.com/)
 
-Servizio API per l'estrazione automatizzata di dati catastali dal portale **SISTER** (Servizi Integrati Telematici dell'Agenzia delle Entrate).
+Servizio REST per l'estrazione automatizzata di dati catastali dal portale **SISTER** dell'Agenzia delle Entrate. Utilizza [Playwright](https://playwright.dev/python/) per pilotare un browser headless e [FastAPI](https://fastapi.tiangolo.com/) per esporre gli endpoint.
 
-> **Disclaimer legale**: questo progetto è uno strumento indipendente e non è affiliato, approvato o supportato dall'Agenzia delle Entrate. L'utente è l'unico responsabile del rispetto dei termini di servizio del portale SISTER e della normativa vigente. L'uso di automazione sul portale potrebbe violare i termini d'uso del servizio.
+> **Disclaimer legale** — Questo progetto è uno strumento indipendente e **non** è affiliato, approvato o supportato dall'Agenzia delle Entrate. L'utente è l'unico responsabile del rispetto dei termini di servizio del portale SISTER e della normativa vigente. L'uso di automazione sul portale potrebbe violare i termini d'uso del servizio.
 
-> **Compatibilità SPID**: il login automatizzato funziona **esclusivamente** con il provider **CIE Sign / Sielte ID**. Altri provider SPID non sono supportati e richiederebbero modifiche al flusso di autenticazione in `utils.py`.
-
-> **Limitazioni note**: alcune città presentano problemi con determinate mappe catastali o sezioni urbane. In questi casi l'estrazione potrebbe fallire o restituire dati incompleti. Il comportamento dipende dalla struttura dei dati sul portale SISTER, che varia da comune a comune.
+---
 
 ## Indice
 
 - [Panoramica](#panoramica)
 - [Architettura](#architettura)
-- [Compatibilità SPID](#compatibilità-spid)
-- [Installazione](#installazione)
+- [Prerequisiti](#prerequisiti)
+- [Avvio rapido](#avvio-rapido)
 - [Configurazione](#configurazione)
 - [Endpoint API](#endpoint-api)
+  - [Health check](#health-check)
+  - [Visura immobili (Fase 1)](#visura-immobili-fase-1)
+  - [Visura intestati (Fase 2)](#visura-intestati-fase-2)
+  - [Polling risultati](#polling-risultati)
+  - [Sezioni territoriali](#sezioni-territoriali)
+  - [Shutdown](#shutdown)
 - [Esempi d'uso](#esempi-duso)
-- [Sviluppo locale](#sviluppo-locale)
-- [Contribuire](#contribuire)
+- [Logging e debug](#logging-e-debug)
+- [Dettagli tecnici](#dettagli-tecnici)
+- [Sviluppo e contribuzione](#sviluppo-e-contribuzione)
+- [Risoluzione dei problemi](#risoluzione-dei-problemi)
 - [Licenza](#licenza)
+
+---
 
 ## Panoramica
 
-Visura API fornisce accesso automatizzato ai dati catastali italiani tramite il portale SISTER. Usa l'automazione del browser (Playwright) e offre un'interfaccia REST per:
+Visura API permette di interrogare i dati catastali italiani tramite una semplice interfaccia HTTP. Il flusso operativo è diviso in due fasi:
 
-1. **Estrarre dati immobiliari** (immobili) per specifiche particelle catastali
-2. **Recuperare i titolari** (intestati) di specifici immobili
-3. **Estrarre le sezioni territoriali** per tutte le province e comuni d'Italia
+| Fase | Endpoint | Descrizione |
+|------|----------|-------------|
+| **1 — Immobili** | `POST /visura` | Cerca gli immobili associati a foglio + particella |
+| **2 — Intestati** | `POST /visura/intestati` | Recupera i titolari di uno specifico subalterno |
+
+Entrambe le richieste vengono accodate ed eseguite sequenzialmente su un singolo browser autenticato al portale SISTER. I risultati si recuperano in polling con `GET /visura/{request_id}`.
 
 ### Funzionalità principali
 
-- **Flusso a due fasi**: prima estrae gli immobili, poi gli intestati per immobili specifici
-- **Filtro automatico**: esclude gli immobili con partita "Soppressa"
-- **Gestione sessione**: mantiene la sessione autenticata con il portale SISTER
-- **Coda di elaborazione**: gestisce richieste multiple senza sovraccaricare il portale
-- **Ri-autenticazione automatica**: alla scadenza della sessione
-- **Distribuzione con Docker**: pronto per il deploy containerizzato
+- **Autenticazione SPID automatizzata** via provider Sielte ID (CIE Sign) con push notification
+- **Coda sequenziale** — le richieste vengono processate una alla volta per non sovraccaricare il portale
+- **Ri-autenticazione automatica** — alla scadenza della sessione, il servizio tenta prima un recovery diretto e, solo se necessario, un nuovo login SPID
+- **Keep-alive** — la sessione viene mantenuta attiva con un light keep-alive ogni 30 secondi e un refresh profondo ogni 5 minuti
+- **Graceful shutdown** — su `SIGINT`/`SIGTERM` il servizio effettua il logout dal portale prima di chiudere il browser
+- **Logging HTML completo** — ogni pagina visitata dal browser viene salvata su disco per debug e audit
+- **Docker-ready** — immagine pronta con tutte le dipendenze di sistema per Chromium headless
+
+### Compatibilità SPID
+
+Il login automatizzato funziona **esclusivamente** con il provider **Sielte ID (CIE Sign)**. Il flusso prevede l'approvazione via push notification sull'app MySielteID. Altri provider SPID non sono supportati e richiederebbero modifiche alla funzione `login()` in `utils.py`.
+
+### Limitazioni note
+
+- Alcune città presentano strutture catastali particolari (sezioni urbane, mappe speciali) che possono causare risultati parziali.
+- Se la particella non esiste nel catasto, il portale restituisce "NESSUNA CORRISPONDENZA TROVATA" e l'API ritorna una lista vuota con il campo `error` valorizzato.
+- Gli immobili con partita "Soppressa" vengono inclusi nei risultati ma senza intestati.
+
+---
 
 ## Architettura
 
 ```
-┌─────────────────┐    ┌─────────────────┐
-│  Applicazione   │───▶│    FastAPI      │
-│    client       │    │   (main.py)     │
-└─────────────────┘    └─────────────────┘
+Client HTTP
+     │
+     ▼
+┌──────────────────────────────────────────────────────┐
+│  FastAPI  (main.py)                                  │
+│                                                      │
+│  ┌─────────────┐  ┌──────────────────────────────┐   │
+│  │ Endpoints   │──│ VisuraService                │   │
+│  │ REST        │  │  • asyncio.Queue             │   │
+│  └─────────────┘  │  • response_store (dict)     │   │
+│                   │  • worker sequenziale        │   │
+│                   └──────────┬───────────────────┘   │
+│                              │                       │
+│  ┌───────────────────────────▼───────────────────┐   │
+│  │ BrowserManager                                │   │
+│  │  • Playwright browser (Chromium headless)     │   │
+│  │  • Keep-alive task                            │   │
+│  │  • Session recovery / re-login                │   │
+│  └───────────────────────────┬───────────────────┘   │
+└──────────────────────────────┼───────────────────────┘
                                │
                                ▼
-                       ┌─────────────────┐
-                       │   Playwright    │
-                       │  (automazione   │
-                       │    browser)     │
-                       └─────────────────┘
-                               │
-                               ▼
-                       ┌─────────────────┐
-                       │   Portale       │
-                       │   SISTER        │
-                       └─────────────────┘
+                ┌──────────────────────────┐
+                │ Portale SISTER           │
+                │ sister3.agenziaentrate   │
+                │ .gov.it                  │
+                └──────────────────────────┘
 ```
 
-### Componenti principali
+### File del progetto
 
 | File | Descrizione |
 |------|-------------|
-| `main.py` | Applicazione FastAPI con endpoint REST e gestione della coda |
-| `utils.py` | Funzioni di automazione del browser con Playwright |
-| `docker-compose.yaml` | Orchestrazione dei container |
+| `main.py` | Applicazione FastAPI: endpoint, modelli Pydantic, `BrowserManager`, `VisuraService`, lifespan |
+| `utils.py` | Automazione browser: `login()`, `logout()`, `run_visura()`, `run_visura_immobile()`, `extract_all_sezioni()`, `PageLogger`, `parse_table()` |
+| `Dockerfile` | Immagine basata su `python:3.11-slim` con dipendenze per Chromium |
+| `docker-compose.yaml` | Orchestrazione con healthcheck, volumi per log, restart automatico |
+| `requirements.txt` | Dipendenze Python |
+| `pyproject.toml` | Metadati di progetto e dipendenze opzionali di sviluppo |
 
-## Compatibilità SPID
+---
 
-> **Importante**: attualmente il login automatizzato è implementato **esclusivamente** per il provider SPID **CIE Sign / Sielte ID**. Se utilizzi un altro provider SPID, dovrai adattare il flusso di autenticazione in `utils.py` (funzione `login()`).
+## Prerequisiti
 
-## Installazione
+- **Python 3.11+** (testato fino a 3.13)
+- **Credenziali SPID** tramite provider Sielte ID con app MySielteID configurata
+- **Convenzione SISTER attiva** — l'utente deve avere un account abilitato sul portale SISTER
 
-### Prerequisiti
+Per Docker:
+- Docker Engine 20+
+- Docker Compose v2
 
-- Python 3.11+
-- Docker e Docker Compose (per il deploy)
-- Credenziali valide per il portale SISTER (SPID tramite CIE Sign / Sielte ID)
+---
 
-### Avvio rapido con Docker
+## Avvio rapido
+
+### Con Docker (raccomandato)
 
 ```bash
-git clone https://github.com/menimenocchio/visura-api.git
+git clone https://github.com/zornade/visura-api.git
 cd visura-api
 
-# Configura le variabili d'ambiente
 cp .env.example .env
-# Modifica .env con le tue credenziali
+# Modifica .env con le tue credenziali SPID
 
-# Avvia il servizio
 docker-compose up -d
 
 # Verifica che il servizio sia attivo
@@ -114,30 +153,49 @@ pip install -r requirements.txt
 playwright install chromium
 
 cp .env.example .env
-# Modifica .env con le tue credenziali
+# Modifica .env con le tue credenziali SPID
 
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+All'avvio il servizio:
+
+1. Lancia un browser Chromium headless
+2. Esegue il login SPID — **approva la notifica push** sull'app MySielteID entro 120 secondi
+3. Naviga fino alla sezione Visure catastali del portale SISTER
+4. Avvia il keep-alive e il worker della coda
+5. Inizia ad accettare richieste su porta 8000
+
+---
+
 ## Configurazione
 
-Crea un file `.env` nella cartella del progetto (vedi `.env.example`):
+Crea un file `.env` nella root del progetto (vedi `.env.example`):
 
 ```env
-# Credenziali SPID / Agenzia delle Entrate
-ADE_USERNAME=il_tuo_codice_fiscale
+# Obbligatorio — Credenziali SPID (Sielte ID)
+ADE_USERNAME=RSSMRA85M01H501Z    # Codice fiscale
 ADE_PASSWORD=la_tua_password
 
-# Configurazione opzionale
-LOG_LEVEL=INFO
-CONCURRENT_WORKERS=3
+# Opzionale
+LOG_LEVEL=INFO                    # DEBUG | INFO | WARNING | ERROR
 ```
+
+| Variabile | Obbligatoria | Default | Descrizione |
+|-----------|:------------:|---------|-------------|
+| `ADE_USERNAME` | ✅ | — | Codice fiscale per il login SPID |
+| `ADE_PASSWORD` | ✅ | — | Password SPID (Sielte ID) |
+| `LOG_LEVEL` | | `INFO` | Livello di log su console e file |
+
+---
 
 ## Endpoint API
 
-### Controllo stato
+### Health check
 
-**`GET /health`** — Verifica lo stato del servizio
+```
+GET /health
+```
 
 ```json
 {
@@ -147,35 +205,125 @@ CONCURRENT_WORKERS=3
 }
 ```
 
-### Fase 1: Estrazione immobili
+---
 
-**`POST /visura`** — Estrae gli immobili per una particella catastale
+### Visura immobili (Fase 1)
+
+```
+POST /visura
+```
+
+Cerca tutti gli immobili su una particella catastale. Se `tipo_catasto` è omesso, vengono accodate **due** richieste (Terreni + Fabbricati).
+
+**Request body:**
+
+| Campo | Tipo | Obbligatorio | Default | Descrizione |
+|-------|------|:------------:|---------|-------------|
+| `provincia` | `string` | ✅ | — | Nome della provincia (es. `"Trieste"`) |
+| `comune` | `string` | ✅ | — | Nome del comune (es. `"TRIESTE"`) |
+| `foglio` | `string` | ✅ | — | Numero foglio |
+| `particella` | `string` | ✅ | — | Numero particella |
+| `sezione` | `string` | | `null` | Sezione censuaria (se presente) |
+| `tipo_catasto` | `string` | | `null` | `"T"` = Terreni, `"F"` = Fabbricati. Se omesso: entrambi |
+
+**Esempio:**
+
+```bash
+curl -X POST http://localhost:8000/visura \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provincia": "Trieste",
+    "comune": "TRIESTE",
+    "foglio": "9",
+    "particella": "166",
+    "tipo_catasto": "F"
+  }'
+```
+
+**Risposta:**
 
 ```json
-// Richiesta
 {
-  "provincia": "Trieste",
-  "comune": "TRIESTE",
-  "foglio": "9",
-  "particella": "166",
-  "sezione": null,
-  "tipo_catasto": "F"   // "F" = Fabbricati, "T" = Terreni (opzionale, se omesso esegue entrambi)
-}
-
-// Risposta
-{
-  "request_ids": ["req_F_1693747200000"],
+  "request_ids": ["req_F_1709312400000"],
   "tipos_catasto": ["F"],
   "status": "queued",
   "message": "Richieste aggiunte alla coda per TRIESTE F.9 P.166"
 }
 ```
 
-**`GET /visura/{request_id}`** — Recupera i risultati di una richiesta
+> **Nota:** per i Terreni (`T`) gli intestati vengono estratti automaticamente. Per i Fabbricati (`F`) vengono restituiti solo gli immobili — per ottenere gli intestati di un singolo fabbricato, usa la Fase 2.
+
+---
+
+### Visura intestati (Fase 2)
+
+```
+POST /visura/intestati
+```
+
+Estrae i titolari (intestati) di uno specifico immobile. Per i Fabbricati è necessario specificare il `subalterno`.
+
+**Request body:**
+
+| Campo | Tipo | Obbligatorio | Default | Descrizione |
+|-------|------|:------------:|---------|-------------|
+| `provincia` | `string` | ✅ | — | Nome della provincia |
+| `comune` | `string` | ✅ | — | Nome del comune |
+| `foglio` | `string` | ✅ | — | Numero foglio |
+| `particella` | `string` | ✅ | — | Numero particella |
+| `tipo_catasto` | `string` | ✅ | — | `"T"` o `"F"` |
+| `subalterno` | `string` | Per `F` | `null` | Subalterno (obbligatorio per Fabbricati, vietato per Terreni) |
+| `sezione` | `string` | | `null` | Sezione censuaria |
+
+**Esempio:**
+
+```bash
+curl -X POST http://localhost:8000/visura/intestati \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provincia": "Trieste",
+    "comune": "TRIESTE",
+    "foglio": "9",
+    "particella": "166",
+    "tipo_catasto": "F",
+    "subalterno": "3"
+  }'
+```
+
+**Risposta:**
 
 ```json
 {
-  "request_id": "req_F_1693747200000",
+  "request_id": "intestati_F_3_1709312500000",
+  "tipo_catasto": "F",
+  "subalterno": "3",
+  "status": "queued",
+  "message": "Richiesta intestati aggiunta alla coda per TRIESTE F.9 P.166 Sub.3",
+  "queue_position": 1
+}
+```
+
+---
+
+### Polling risultati
+
+```
+GET /visura/{request_id}
+```
+
+Recupera lo stato e i dati di una richiesta precedentemente accodata.
+
+| Status | Significato |
+|--------|-------------|
+| `processing` | La richiesta è in coda o in esecuzione |
+| `completed` | Dati disponibili nel campo `data` |
+| `error` | Errore — dettagli nel campo `error` |
+
+**Risposta completata (Fase 1):**
+
+```json
+{
+  "request_id": "req_F_1709312400000",
   "tipo_catasto": "F",
   "status": "completed",
   "data": {
@@ -183,224 +331,400 @@ CONCURRENT_WORKERS=3
       {
         "Foglio": "9",
         "Particella": "166",
-        "Sub": "1",
+        "Sub": "3",
         "Categoria": "A/2",
-        "Indirizzo": "Via Roma 123",
-        "Rendita": "500.00"
+        "Classe": "5",
+        "Consistenza": "4.5",
+        "Rendita": "500,00",
+        "Indirizzo": "VIA ROMA 10",
+        "Partita": "12345"
       }
     ],
+    "results": [
+      {
+        "result_index": 1,
+        "immobile": { },
+        "intestati": []
+      }
+    ],
+    "total_results": 1,
     "intestati": []
   },
-  "timestamp": "2026-03-15T10:30:00"
+  "error": null,
+  "timestamp": "2026-03-06T10:30:00"
 }
 ```
 
-### Fase 2: Estrazione intestati
-
-**`POST /visura/intestati`** — Estrae gli intestati di un immobile specifico
+**Risposta completata (Fase 2 — intestati):**
 
 ```json
-// Richiesta
 {
-  "provincia": "Trieste",
-  "comune": "TRIESTE",
-  "foglio": "9",
-  "particella": "166",
-  "tipo_catasto": "F",
-  "subalterno": "1"   // Obbligatorio per Fabbricati
-}
-
-// Risposta
-{
-  "request_id": "intestati_F_1_1693747300000",
-  "tipo_catasto": "F",
-  "subalterno": "1",
-  "status": "queued",
-  "queue_position": 1
+  "request_id": "intestati_F_3_1709312500000",
+  "status": "completed",
+  "data": {
+    "immobile": {
+      "Foglio": "9",
+      "Particella": "166",
+      "Sub": "3"
+    },
+    "intestati": [
+      {
+        "Nominativo o denominazione": "ROSSI MARIO",
+        "Codice fiscale": "RSSMRA85M01H501Z",
+        "Titolarità": "Proprietà per 1/1"
+      }
+    ],
+    "total_intestati": 1
+  }
 }
 ```
+
+**Risposta con nessuna corrispondenza:**
+
+```json
+{
+  "request_id": "req_F_1709312400000",
+  "status": "completed",
+  "data": {
+    "immobili": [],
+    "results": [],
+    "total_results": 0,
+    "intestati": [],
+    "error": "NESSUNA CORRISPONDENZA TROVATA"
+  }
+}
+```
+
+---
 
 ### Sezioni territoriali
 
-**`POST /sezioni/extract`** — Avvia l'estrazione delle sezioni per tutte le province
-
-```json
-// Richiesta
-{
-  "tipo_catasto": "T",
-  "max_province": 200
-}
-
-// Risposta
-{
-  "status": "success",
-  "message": "Estrazione completata per tipo catasto T",
-  "total_extracted": 42000,
-  "tipo_catasto": "T",
-  "sezioni": [...]
-}
+```
+POST /sezioni/extract
 ```
 
-### Altro
+Estrae le sezioni censuarie per tutte le province e comuni d'Italia. **Operazione molto lenta** — può richiedere ore.
 
-| Endpoint | Metodo | Descrizione |
-|----------|--------|-------------|
-| `/shutdown` | POST | Shutdown controllato con logout dal portale |
+| Campo | Tipo | Default | Descrizione |
+|-------|------|---------|-------------|
+| `tipo_catasto` | `string` | `"T"` | `"T"` o `"F"` |
+| `max_province` | `int` | `200` | Numero massimo di province da processare (1–200) |
+
+---
+
+### Shutdown
+
+```
+POST /shutdown
+```
+
+Esegue un shutdown controllato: logout dal portale SISTER e chiusura del browser.
+
+---
 
 ## Esempi d'uso
 
 ### Flusso completo con cURL
 
 ```bash
-# 1. Avvia l'estrazione dei fabbricati per una particella
-curl -X POST "http://localhost:8000/visura" \
+# 1. Avvia l'estrazione dei fabbricati
+curl -s -X POST http://localhost:8000/visura \
   -H "Content-Type: application/json" \
-  -d '{"provincia": "Trieste", "comune": "TRIESTE", "foglio": "9", "particella": "166", "tipo_catasto": "F"}'
+  -d '{"provincia":"Roma","comune":"ROMA","foglio":"100","particella":"50","tipo_catasto":"F"}' \
+  | jq .
 
-# 2. Controlla i risultati (attendi qualche secondo)
-curl "http://localhost:8000/visura/req_F_1693747200000"
+# Salva il request_id dalla risposta, poi:
 
-# 3. Estrai gli intestati per un immobile specifico
-curl -X POST "http://localhost:8000/visura/intestati" \
+# 2. Polling risultati (ripeti fino a status != "processing")
+curl -s http://localhost:8000/visura/req_F_1709312400000 | jq .
+
+# 3. Prendi un subalterno dai risultati e chiedi gli intestati
+curl -s -X POST http://localhost:8000/visura/intestati \
   -H "Content-Type: application/json" \
-  -d '{"provincia": "Trieste", "comune": "TRIESTE", "foglio": "9", "particella": "166", "tipo_catasto": "F", "subalterno": "1"}'
+  -d '{"provincia":"Roma","comune":"ROMA","foglio":"100","particella":"50","tipo_catasto":"F","subalterno":"3"}' \
+  | jq .
+
+# 4. Polling intestati
+curl -s http://localhost:8000/visura/intestati_F_3_1709312500000 | jq .
 ```
 
 ### Client Python
 
 ```python
-import requests
-import time
+import requests, time
 
-class ClientVisura:
-    def __init__(self, url_base="http://localhost:8000"):
-        self.url_base = url_base
+BASE = "http://localhost:8000"
 
-    def estrai_immobili(self, provincia, comune, foglio, particella, sezione=None, tipo_catasto="F"):
-        """Fase 1: Estrae gli immobili di una particella"""
-        dati = {
-            "provincia": provincia,
-            "comune": comune,
-            "foglio": foglio,
-            "particella": particella,
-            "tipo_catasto": tipo_catasto
-        }
-        if sezione:
-            dati["sezione"] = sezione
-        risposta = requests.post(f"{self.url_base}/visura", json=dati)
-        return risposta.json()
+def visura_completa(provincia, comune, foglio, particella, tipo="F", subalterno=None):
+    # Fase 1: immobili
+    r = requests.post(f"{BASE}/visura", json={
+        "provincia": provincia, "comune": comune,
+        "foglio": foglio, "particella": particella,
+        "tipo_catasto": tipo
+    }).json()
 
-    def attendi_risultati(self, request_id, attesa_max=300):
-        """Attende il completamento di una richiesta"""
-        inizio = time.time()
-        while time.time() - inizio < attesa_max:
-            risposta = requests.get(f"{self.url_base}/visura/{request_id}")
-            risultato = risposta.json()
-            if risultato["status"] in ["completed", "error"]:
-                return risultato
-            time.sleep(5)
-        raise TimeoutError(f"Richiesta {request_id} non completata entro {attesa_max} secondi")
+    rid = r["request_ids"][0]
 
-    def estrai_intestati(self, provincia, comune, foglio, particella, tipo_catasto, subalterno=None, sezione=None):
-        """Fase 2: Estrae gli intestati di un immobile"""
-        dati = {
-            "provincia": provincia,
-            "comune": comune,
-            "foglio": foglio,
-            "particella": particella,
-            "tipo_catasto": tipo_catasto
-        }
-        if subalterno:
-            dati["subalterno"] = subalterno
-        if sezione:
-            dati["sezione"] = sezione
-        risposta = requests.post(f"{self.url_base}/visura/intestati", json=dati)
-        return risposta.json()
+    # Polling
+    while True:
+        res = requests.get(f"{BASE}/visura/{rid}").json()
+        if res["status"] != "processing":
+            break
+        time.sleep(5)
 
-# Esempio d'uso
-client = ClientVisura()
+    if res["status"] == "error":
+        raise Exception(res["error"])
 
-# Estrai i fabbricati
-estrazione = client.estrai_immobili("Trieste", "TRIESTE", "9", "166", tipo_catasto="F")
-request_id = estrazione["request_ids"][0]
+    immobili = res["data"]["immobili"]
+    print(f"Trovati {len(immobili)} immobili")
 
-# Attendi i risultati
-risultati = client.attendi_risultati(request_id)
-print(f"Trovati {len(risultati['data']['immobili'])} immobili")
+    if not subalterno or tipo == "T":
+        return res["data"]
 
-# Estrai gli intestati del primo immobile
-intestati = client.estrai_intestati("Trieste", "TRIESTE", "9", "166", "F", subalterno="1")
+    # Fase 2: intestati per uno specifico subalterno
+    r2 = requests.post(f"{BASE}/visura/intestati", json={
+        "provincia": provincia, "comune": comune,
+        "foglio": foglio, "particella": particella,
+        "tipo_catasto": tipo, "subalterno": subalterno
+    }).json()
+
+    rid2 = r2["request_id"]
+
+    while True:
+        res2 = requests.get(f"{BASE}/visura/{rid2}").json()
+        if res2["status"] != "processing":
+            break
+        time.sleep(5)
+
+    return res2["data"]
+
+
+# Esempio
+dati = visura_completa("Roma", "ROMA", "100", "50", tipo="F", subalterno="3")
+print(dati)
 ```
 
-## Sviluppo locale
+---
 
-### Configurazione
+## Logging e debug
+
+Il servizio produce due livelli di logging:
+
+### Log testuale
+
+Scritto su **stdout** e su **file** in `logs/visura.log`. Contiene l'intero flusso operativo: login, navigazione, estrazione dati, errori.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pip install pytest pytest-cov black ruff   # dipendenze di sviluppo
-playwright install chromium
+# Avvia con log dettagliati
+LOG_LEVEL=DEBUG uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-### Eseguire i test
+### Log HTML delle pagine (`PageLogger`)
+
+Ogni pagina visitata dal browser viene salvata come file HTML su disco. Questo permette di ispezionare esattamente ciò che il browser ha visto in ogni punto del flusso — utile per debug, audit e sviluppo.
+
+**Struttura directory:**
+
+```
+logs/pages/
+└── 2026-03-06_16-28-24/          ← session_id (reset ad ogni avvio del server)
+    ├── login/
+    │   ├── 01_goto_login.html
+    │   ├── 02_entra_con_spid.html
+    │   ├── 03_sielte.html
+    │   ├── ...
+    │   └── 15_conferma_lettura.html
+    ├── visura/
+    │   ├── 01_scelta_servizio.html
+    │   ├── 02_provincia_applicata.html
+    │   ├── 03_immobile.html
+    │   ├── 04_ricerca.html
+    │   ├── 05_conferma_subalterno.html
+    │   ├── 06_risultati.html
+    │   └── 07_intestati_r1.html
+    ├── visura_002/                ← seconda visura nella stessa sessione
+    │   └── ...
+    ├── logout/
+    │   ├── 01_before_logout.html
+    │   └── 02_after_logout.html
+    └── recovery/
+        └── ...
+```
+
+Ogni file HTML include in testa dei commenti con metadati:
+
+```html
+<!-- URL: https://sister3.agenziaentrate.gov.it/Visure/... -->
+<!-- Step: ricerca -->
+<!-- Timestamp: 2026-03-06T16:30:45 -->
+```
+
+> **Privacy:** la directory `logs/pages/` è nel `.gitignore` perché i file HTML contengono dati personali (codice fiscale, intestatari, indirizzi). Non committare mai questi file.
+
+---
+
+## Dettagli tecnici
+
+### Gestione della sessione
+
+| Meccanismo | Intervallo | Descrizione |
+|------------|------------|-------------|
+| **Light keep-alive** | 30 secondi | Mouse move sulla pagina per evitare timeout idle |
+| **Session refresh** | 5 minuti | Naviga a `SceltaServizio.do` e verifica che la sessione sia ancora attiva |
+| **Recovery** | Su errore | Navigazione diretta → percorso interno → re-login SPID completo |
+
+### Coda di elaborazione
+
+- Unica `asyncio.Queue` con worker sequenziale
+- Pausa di **2 secondi** tra una richiesta e l'altra
+- Pausa di **5 secondi** dopo un errore
+- I risultati restano in memoria (`response_store`) fino al riavvio del servizio
+- Il client fa polling su `GET /visura/{request_id}` — restituisce `"processing"` finché il risultato non è pronto
+
+### Graceful shutdown
+
+Quando uvicorn riceve `SIGINT` o `SIGTERM`:
+
+1. Il lifespan `shutdown` viene invocato da uvicorn
+2. `logout()` clicca "Esci" sul portale SISTER
+3. `close()` clicca "Torna al portale", chiude il browser context, chiude Chromium
+
+Il browser viene lanciato con `handle_sigint=False, handle_sigterm=False` per impedire che Chromium intercetti i segnali prima che il logout sia completato.
+
+### Flusso di autenticazione SPID (Sielte ID)
+
+1. Naviga alla pagina di login dell'Agenzia delle Entrate
+2. Clicca "Entra con SPID" → seleziona provider Sielte ID
+3. Inserisce codice fiscale (con CapsLock attivo) e password
+4. Clicca "Prosegui" → seleziona invio notifica push
+5. Clicca "Autorizza" → **attende fino a 120 secondi** l'approvazione sull'app MySielteID
+6. Cerca "SISTER" tra i servizi → clicca "Vai al servizio"
+7. Verifica assenza di sessione bloccata ("Utente già in sessione")
+8. Naviga: Conferma → Consultazioni e Certificazioni → Visure catastali → Conferma Lettura
+
+### Flusso della visura
+
+1. Naviga a `SceltaServizio.do` — seleziona provincia — clicca Applica
+2. Clicca "Immobile" — seleziona tipo catasto (`T`/`F`), comune, compila foglio e particella
+3. Clicca "Ricerca" — gestisce eventuale "conferma assenza subalterno"
+4. Se "NESSUNA CORRISPONDENZA TROVATA" → ritorna risultato vuoto con `.error`
+5. Estrae la tabella immobili (`table.listaIsp4`)
+6. Per ogni immobile (radio button): seleziona → clicca "Intestati" → estrae tabella intestatari → torna indietro
+7. Gli immobili con `Partita = "Soppressa"` vengono inclusi ma senza estrazione intestati
+
+---
+
+## Sviluppo e contribuzione
+
+### Setup ambiente di sviluppo
+
+```bash
+git clone https://github.com/zornade/visura-api.git
+cd visura-api
+
+python -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+pip install -e ".[dev]"            # pytest, black, ruff
+playwright install chromium
+
+cp .env.example .env
+# Configura le credenziali
+```
+
+### Struttura del codice
+
+**`main.py`** contiene:
+- Modelli Pydantic di input (`VisuraInput`, `VisuraIntestatiInput`, `SezioniExtractionRequest`)
+- Dataclass interne (`VisuraRequest`, `VisuraResponse`, `VisuraIntestatiRequest`)
+- Eccezioni custom (`VisuraError`, `AuthenticationError`, `BrowserError`, `ValidationError`)
+- `BrowserManager` — gestione browser, login, keep-alive, session recovery
+- `VisuraService` — coda, worker, store risultati
+- Lifespan FastAPI (startup/shutdown)
+- Tutti gli endpoint REST
+
+**`utils.py`** contiene:
+- `PageLogger` — salva HTML di ogni pagina visitata, organizzato per sessione/flusso/step
+- `login(page, username, password)` — flusso SPID completo (15 step, ciascuno loggato)
+- `logout(page)` — cerca e clicca "Esci" con fallback su più selettori CSS
+- `run_visura(page, ...)` — visura completa: selezione provincia → estrazione intestati
+- `run_visura_immobile(page, ...)` — visura mirata per un singolo fabbricato con subalterno
+- `extract_all_sezioni(page, ...)` — iterazione su tutte le province/comuni per estrarre sezioni
+- `find_best_option_match(page, selector, text)` — fuzzy matching a 5 livelli su dropdown `<select>`
+- `parse_table(html)` — parsing tabelle HTML con BeautifulSoup → lista di dizionari
+
+### Aggiungere un provider SPID
+
+Il login è implementato nella funzione `login()` di `utils.py`. Per supportare un altro provider:
+
+1. Modifica il selettore del provider (attualmente `a[href*="sielte"]`)
+2. Adatta il form di inserimento credenziali (ogni provider ha layout diversi)
+3. Gestisci il metodo di approvazione (push notification, OTP, etc.)
+
+### Convenzioni per il logging HTML
+
+Quando aggiungi nuovi flussi o step, usa `PageLogger`:
+
+```python
+logger = PageLogger("nome_flusso")    # Crea logger per questo flusso
+await logger.log(page, "nome_step")   # Salva HTML della pagina corrente
+```
+
+I file vengono numerati automaticamente (`01_nome_step.html`, `02_...`). Flussi ripetuti nella stessa sessione ricevono un suffisso incrementale (`visura`, `visura_002`, `visura_003`, ...).
+
+### Formattazione e linting
+
+```bash
+black .           # formattazione automatica
+ruff check .      # controllo linting
+```
+
+### Test
 
 ```bash
 python -m pytest test_*.py -v
 ```
 
-### Formattazione e linting
-
-```bash
-black .          # formattazione automatica
-ruff check .     # controllo linting
-```
-
 ### Docker
 
 ```bash
-# Avvia il servizio
-docker-compose up --build
-
-# Visualizza i log
-docker-compose logs -f visure-service
+docker-compose up --build         # build e avvio
+docker-compose logs -f             # segui i log
+docker-compose down                # stop e rimozione container
 ```
 
-### Log
+### Linee guida
 
-I log vengono scritti sia su console che su file (`logs/visura.log`).
+Leggi [CONTRIBUTING.md](CONTRIBUTING.md) per il dettaglio completo. In breve:
 
-Livelli disponibili: `DEBUG`, `INFO`, `WARNING`, `ERROR`
+- Crea un branch dal `main` con un nome descrittivo (`fix/...`, `feat/...`)
+- Ogni modifica significativa deve includere i log `PageLogger` nei punti critici
+- **Mai committare** file da `logs/` — contengono dati personali
+- Rimuovi le credenziali dai log prima di condividerli in una issue
 
-```bash
-# Abilita i log dettagliati
-export LOG_LEVEL=DEBUG
-```
-
-## Considerazioni sulle prestazioni
-
-- Il portale SISTER ha limiti interni di frequenza delle richieste
-- Il servizio accoda le richieste per non sovraccaricare il portale
-- Tempo tipico di elaborazione: 30-60 secondi per richiesta
-- **Requisiti minimi**: 2 GB RAM, 2 core CPU, connessione stabile
+---
 
 ## Risoluzione dei problemi
 
-| Problema | Soluzione |
-|----------|----------|
-| Il servizio non si avvia | Controlla i log: `docker-compose logs visure-service` |
-| Autenticazione fallita | Verifica le credenziali nel file `.env` |
-| Risposte lente | Controlla la dimensione della coda: `GET /health` |
-| Sessione scaduta | Il servizio si ri-autentica automaticamente |
+| Problema | Causa probabile | Soluzione |
+|----------|----------------|----------|
+| Il login non parte | Credenziali mancanti | Verifica `ADE_USERNAME` e `ADE_PASSWORD` nel file `.env` |
+| Timeout su "Autorizza" | Push non approvata in tempo | Approva la notifica MySielteID entro 120 secondi |
+| "Utente già in sessione" | Sessione precedente non chiusa | Attendi qualche minuto o chiudi manualmente dal portale |
+| Sessione scaduta durante visura | Inattività prolungata | Il servizio tenta il recovery automatico; se fallisce, ri-esegue il login |
+| "NESSUNA CORRISPONDENZA TROVATA" | Dati catastali inesistenti | Verifica foglio, particella, tipo catasto e comune |
+| Risposte lente | Coda piena | Controlla `queue_size` con `GET /health` |
+| Chromium non si avvia in Docker | Dipendenze di sistema mancanti | Usa il Dockerfile fornito che include tutte le librerie necessarie |
+| Log HTML vuoti o mancanti | Errore durante il salvataggio | Controlla i permessi sulla directory `logs/pages/` |
 
-## Contribuire
+Per debug approfondito, ispeziona i file HTML in `logs/pages/` — mostrano esattamente cosa vedeva il browser in ogni step.
 
-Leggi [CONTRIBUTING.md](CONTRIBUTING.md) per le linee guida su come contribuire al progetto.
+---
 
 ## Licenza
 
-Questo progetto è distribuito sotto la licenza **GNU General Public License v3.0**. Vedi il file [LICENSE](LICENSE) per i dettagli.
+Distribuito sotto licenza [GNU General Public License v3.0](LICENSE).
 
 ---
 

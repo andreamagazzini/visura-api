@@ -1,5 +1,12 @@
 from bs4 import BeautifulSoup
 import time
+from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+import os
+import re
+from datetime import datetime
+
+PAGES_LOG_DIR = "./logs/pages"
+
 
 def parse_table(html):
     soup = BeautifulSoup(html, "html.parser")
@@ -14,9 +21,68 @@ def parse_table(html):
             rows.append(dict(zip(headers, cells)))
     return rows
 
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
-import os
-import re
+
+class PageLogger:
+    """Salva l'HTML di ogni pagina visitata, organizzato per sessione e flusso.
+
+    Struttura directory:
+        logs/pages/{session_id}/{flow_name}/01_step.html
+        logs/pages/{session_id}/{flow_name}/02_step.html
+        ...
+
+    Se lo stesso flusso viene eseguito più volte nella stessa sessione,
+    le cartelle successive vengono numerate: visura, visura_002, visura_003, ecc.
+    """
+
+    _session_id: str = None
+    _flow_counters: dict = {}
+
+    @classmethod
+    def reset_session(cls):
+        """Resetta la sessione (da chiamare ad ogni avvio del server)."""
+        cls._session_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        cls._flow_counters = {}
+
+    def __init__(self, flow_name: str):
+        if PageLogger._session_id is None:
+            PageLogger._session_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        # Contatore per differenziare flussi ripetuti (visura_002, visura_003…)
+        count = PageLogger._flow_counters.get(flow_name, 0) + 1
+        PageLogger._flow_counters[flow_name] = count
+
+        self.flow_name = flow_name
+        self.step = 0
+
+        dir_name = flow_name if count == 1 else f"{flow_name}_{count:03d}"
+        self.base_dir = os.path.join(PAGES_LOG_DIR, PageLogger._session_id, dir_name)
+        os.makedirs(self.base_dir, exist_ok=True)
+
+    async def log(self, page: Page, step_name: str) -> None:
+        """Salva l'HTML corrente della pagina su disco."""
+        self.step += 1
+        try:
+            if not page or page.is_closed():
+                print(f"[PAGE_LOG] {self.flow_name}/{step_name}: pagina chiusa, skip")
+                return
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            url = page.url
+            html = await page.content()
+            safe_name = re.sub(r'[^\w\-]', '_', step_name)
+            filename = f"{self.step:02d}_{safe_name}.html"
+            filepath = os.path.join(self.base_dir, filename)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(f"<!-- URL: {url} -->\n")
+                f.write(f"<!-- Step: {step_name} -->\n")
+                f.write(f"<!-- Timestamp: {datetime.now().isoformat()} -->\n\n")
+                f.write(html)
+            print(f"[PAGE_LOG] {self.flow_name}/{filename}")
+        except Exception as e:
+            print(f"[PAGE_LOG] Errore salvataggio {step_name}: {e}")
+
 
 async def login(page: Page):
     ade_username = os.getenv("ADE_USERNAME")
@@ -25,64 +91,108 @@ async def login(page: Page):
     if not ade_username or not ade_password:
         raise ValueError("ADE_USERNAME and ADE_PASSWORD environment variables must be set")
     
-    print("[LOGIN] Navigo alla pagina di login...")
-    await page.goto("https://iampe.agenziaentrate.gov.it/sam/UI/Login?realm=/agenziaentrate")
-    print("[LOGIN] Clicco 'Entra con SPID'...")
-    await page.get_by_role("button", name="Entra con SPID").click()
-    print("[LOGIN] Clicco 'Sielte ID'...")
-    await page.locator('a[href*="sielte"]').click()
-    print("[LOGIN] Inserisco username...")
-    await page.get_by_role("textbox", name="Codice Fiscale / Partita IVA").press("CapsLock")
-    await page.get_by_role("textbox", name="Codice Fiscale / Partita IVA").fill(ade_username)
-    print("[LOGIN] Inserisco password...")
-    await page.get_by_role("textbox", name="Password").click()
-    await page.get_by_role("textbox", name="Password").fill(ade_password)
-    print("[LOGIN] Clicco 'Prosegui'...")
-    await page.get_by_role("button", name="Prosegui").click()
-    print("[LOGIN] Cerco link notifica (può non esserci)...")
+    logger = PageLogger("login")
+    step = "init"
+    
     try:
-        await page.get_by_role("link", name="Utilizza il le notifiche Ricevi una notifica sull'app MySielteID").click(timeout=4000)
-        print("[LOGIN] Cliccato link notifica (testo completo).")
-    except PlaywrightTimeoutError:
-        print("[LOGIN] Link notifica con testo completo non trovato, provo fallback...")
-        # Fallback: cerca <a> con alt="Utilizza il le notifiche" e <p> con testo 'Ricevi una notifica sull'app MySielteID'
+        step = "goto_login"
+        print("[LOGIN] Navigo alla pagina di login...")
+        await page.goto("https://iampe.agenziaentrate.gov.it/sam/UI/Login?realm=/agenziaentrate")
+        await logger.log(page, "goto_login")
+        
+        step = "entra_con_spid"
+        print("[LOGIN] Clicco 'Entra con SPID'...")
+        await page.get_by_role("button", name="Entra con SPID").click()
+        await logger.log(page, "entra_con_spid")
+        
+        step = "sielte_id"
+        print("[LOGIN] Clicco 'Sielte ID'...")
+        await page.locator('a[href*="sielte"]').click()
+        await logger.log(page, "sielte_id")
+        
+        step = "username"
+        print("[LOGIN] Inserisco username...")
+        await page.get_by_role("textbox", name="Codice Fiscale / Partita IVA").press("CapsLock")
+        await page.get_by_role("textbox", name="Codice Fiscale / Partita IVA").fill(ade_username)
+        await logger.log(page, "username")
+        
+        step = "password"
+        print("[LOGIN] Inserisco password...")
+        await page.get_by_role("textbox", name="Password").click()
+        await page.get_by_role("textbox", name="Password").fill(ade_password)
+        
+        step = "prosegui"
+        print("[LOGIN] Clicco 'Prosegui'...")
+        await page.get_by_role("button", name="Prosegui").click()
+        await logger.log(page, "prosegui")
+        
+        step = "notifica_push"
+        print("[LOGIN] Cerco link notifica (può non esserci)...")
         try:
-            await page.locator('a.link-sso:has(img[alt="Utilizza il le notifiche"]):has(p:text("Ricevi una notifica sull\'app MySielteID"))').click(timeout=4000)
-            print("[LOGIN] Cliccato link notifica (fallback DOM selector).")
+            await page.get_by_role("link", name="Utilizza il le notifiche Ricevi una notifica sull'app MySielteID").click(timeout=4000)
+            print("[LOGIN] Cliccato link notifica (testo completo).")
         except PlaywrightTimeoutError:
-            print("[LOGIN] Nessun link notifica trovato, stampo contenuto pagina per debug:")
-            content = await page.content()
-            print("[LOGIN][DEBUG] HTML pagina:\n" + content)
-            print("[LOGIN] Continuo comunque.")
-    print("[LOGIN] Clicco 'Autorizza'...")
-    await page.get_by_role("button", name="Autorizza").click()
-    print("[LOGIN] Cerco servizio SISTER...")
-    await page.get_by_role("textbox", name="Cerca il servizio").click()
-    await page.get_by_role("textbox", name="Cerca il servizio").fill("SISTER")
-    await page.get_by_role("textbox", name="Cerca il servizio").press("Enter")
-    print("[LOGIN] Clicco 'Vai al servizio'...")
-    await page.get_by_role("link", name="Vai al servizio").first.click()
+            print("[LOGIN] Link notifica con testo completo non trovato, provo fallback...")
+            try:
+                await page.locator('a.link-sso:has(img[alt="Utilizza il le notifiche"]):has(p:text("Ricevi una notifica sull\'app MySielteID"))').click(timeout=4000)
+                print("[LOGIN] Cliccato link notifica (fallback DOM selector).")
+            except PlaywrightTimeoutError:
+                print("[LOGIN] Nessun link notifica trovato, continuo...")
+        await logger.log(page, "notifica_push")
+        
+        step = "autorizza"
+        print("[LOGIN] Clicco 'Autorizza'... (attendo conferma notifica push, timeout 120s)")
+        await page.get_by_role("button", name="Autorizza").click(timeout=120000)
+        await logger.log(page, "autorizza")
+        
+        step = "cerca_sister"
+        print("[LOGIN] Cerco servizio SISTER...")
+        await page.get_by_role("textbox", name="Cerca il servizio").click()
+        await page.get_by_role("textbox", name="Cerca il servizio").fill("SISTER")
+        await page.get_by_role("textbox", name="Cerca il servizio").press("Enter")
+        await logger.log(page, "cerca_sister")
+        
+        step = "vai_al_servizio"
+        print("[LOGIN] Clicco 'Vai al servizio'...")
+        await page.get_by_role("link", name="Vai al servizio").first.click()
 
-    print("[LOGIN] Attendo caricamento pagina...")
-    await page.wait_for_load_state("networkidle")
-    print("[LOGIN] Controllo blocco sessione...")
-    content = await page.content()
-    url = page.url
-    if (
-        "Utente gia' in sessione" in content
-        or "error_locked.jsp" in url
-    ):
-        print("[LOGIN][ERRORE] Utente già in sessione su un'altra postazione!")
-        raise Exception("Utente già in sessione su un'altra postazione")
+        step = "controllo_sessione"
+        print("[LOGIN] Attendo caricamento pagina...")
+        await page.wait_for_load_state("networkidle")
+        await logger.log(page, "vai_al_servizio")
+        print("[LOGIN] Controllo blocco sessione...")
+        content = await page.content()
+        url = page.url
+        if (
+            "Utente gia' in sessione" in content
+            or "error_locked.jsp" in url
+        ):
+            print("[LOGIN][ERRORE] Utente già in sessione su un'altra postazione!")
+            raise Exception("Utente già in sessione su un'altra postazione")
 
-    print("[LOGIN] Clicco 'Conferma'...")
-    await page.get_by_role("button", name="Conferma").click()
-    print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
-    await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
-    print("[LOGIN] Clicco 'Visure catastali'...")
-    await page.get_by_role("link", name="Visure catastali").click()
-    print("[LOGIN] Clicco 'Conferma Lettura'...")
-    await page.get_by_role("link", name="Conferma Lettura").click()
+        step = "conferma"
+        print("[LOGIN] Clicco 'Conferma'...")
+        await page.get_by_role("button", name="Conferma").click()
+        await logger.log(page, "conferma")
+        
+        step = "consultazioni"
+        print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
+        await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
+        await logger.log(page, "consultazioni")
+        
+        step = "visure_catastali"
+        print("[LOGIN] Clicco 'Visure catastali'...")
+        await page.get_by_role("link", name="Visure catastali").click()
+        await logger.log(page, "visure_catastali")
+        
+        step = "conferma_lettura"
+        print("[LOGIN] Clicco 'Conferma Lettura'...")
+        await page.get_by_role("link", name="Conferma Lettura").click()
+        await logger.log(page, "conferma_lettura")
+        
+    except Exception as e:
+        await logger.log(page, f"ERRORE_{step}")
+        raise
 
 async def find_best_option_match(page, selector, search_text):
     """Trova l'opzione che meglio corrisponde al testo cercato"""
@@ -147,6 +257,7 @@ async def find_best_option_match(page, selector, search_text):
 
 async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, foglio='9', particella='166', tipo_catasto='T', extract_intestati=True):
     time0=time.time()
+    logger = PageLogger("visura")
     sezione_info = f", sezione={sezione}" if sezione else ", sezione=None"
     print(f"[VISURA] Inizio visura: provincia={provincia}, comune={comune}{sezione_info}, foglio={foglio}, particella={particella}, tipo_catasto={tipo_catasto}")
     
@@ -155,9 +266,10 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
     
     # STEP 1: Selezione Ufficio Provinciale
     print("[VISURA] Navigando alla pagina di scelta servizio...")
-    await page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
+    await page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
     await page.wait_for_load_state("networkidle", timeout=30000)
     print("[VISURA] Pagina caricata")
+    await logger.log(page, "scelta_servizio")
     
     # Verifica che siamo realmente nella pagina di scelta servizio
     current_url = page.url
@@ -208,12 +320,14 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
     await page.locator("input[type='submit'][value='Applica']").click()
     await page.wait_for_load_state("networkidle", timeout=30000)
     print("[VISURA] Applica cliccato, pagina caricata")
+    await logger.log(page, "provincia_applicata")
     
     # STEP 2: Ricerca per immobili
     print("[VISURA] Cliccando link Immobile...")
     await page.get_by_role("link", name="Immobile").click()
     await page.wait_for_load_state("networkidle", timeout=30000)
     print("[VISURA] Link Immobile cliccato")
+    await logger.log(page, "immobile")
     
     # STEP 2.1: Seleziona tipo catasto (T=Terreni, F=Fabbricati)
     print(f"[VISURA] Selezionando tipo catasto: {tipo_catasto} ({'Terreni' if tipo_catasto == 'T' else 'Fabbricati'})")
@@ -306,6 +420,7 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
     await page.locator("input[name='scelta'][value='Ricerca']").click()
     await page.wait_for_load_state("networkidle", timeout=30000)
     print("[VISURA] Ricerca cliccata")
+    await logger.log(page, "ricerca")
     
     # STEP 3: Gestisci conferma assenza subalterno (se necessario)
     try:
@@ -316,8 +431,24 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
             await conferma_button.click()
             await page.wait_for_load_state("networkidle", timeout=30000)
             print("[VISURA] Conferma assenza subalterno cliccata")
+            await logger.log(page, "conferma_subalterno")
     except Exception as e:
         print(f"[VISURA] Errore o non necessaria conferma subalterno: {e}")
+    
+    await logger.log(page, "risultati")
+    
+    # STEP 3.1: Controlla se la ricerca ha restituito risultati
+    page_text = await page.inner_text("body")
+    if "NESSUNA CORRISPONDENZA TROVATA" in page_text:
+        time1 = time.time()
+        print(f"[VISURA] Nessuna corrispondenza trovata per foglio={foglio}, particella={particella} in {time1-time0:.2f}s")
+        return {
+            "immobili": [],
+            "results": [],
+            "total_results": 0,
+            "intestati": [],
+            "error": "NESSUNA CORRISPONDENZA TROVATA"
+        }
     
     # STEP 4: Estrazione tabella Elenco Immobili
     print("[VISURA] Estraendo tabella Elenco Immobili...")
@@ -363,28 +494,7 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
         
         if not immobili:
             print("[VISURA] Tabella Elenco Immobili non trovata con nessun selettore")
-            # Debug: salviamo il contenuto della pagina per analisi
-            try:
-                page_content = await page.content()
-                with open("/tmp/debug_immobili.html", "w", encoding="utf-8") as f:
-                    f.write(page_content)
-                print("[DEBUG] Contenuto pagina salvato in /tmp/debug_immobili.html")
-                
-                # Verifichiamo se ci sono tabelle in generale
-                all_tables = page.locator("table")
-                table_count = await all_tables.count()
-                print(f"[DEBUG] Totale tabelle trovate nella pagina: {table_count}")
-                
-                # Proviamo a vedere il contenuto delle prime tabelle
-                for i in range(min(table_count, 3)):
-                    try:
-                        table_html = await all_tables.nth(i).inner_html(timeout=5000)
-                        print(f"[DEBUG] Tabella {i} prime 200 caratteri: {table_html[:200]}")
-                    except:
-                        print(f"[DEBUG] Errore lettura tabella {i}")
-                        
-            except Exception as e:
-                print(f"[DEBUG] Errore debug: {e}")
+            await logger.log(page, "immobili_non_trovati")
             immobili = []
     except Exception as e:
         print(f"[VISURA] Errore estrazione immobili: {e}")
@@ -461,9 +571,9 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
                     intestati_button = None
                     for selector in intestati_button_selectors:
                         try:
-                            button = page.locator(selector).first()
-                            if await button.count() > 0:
-                                intestati_button = button
+                            locator = page.locator(selector)
+                            if await locator.count() > 0:
+                                intestati_button = locator.first
                                 print(f"[VISURA] Bottone Intestati trovato con selettore: {selector}")
                                 break
                         except Exception as e:
@@ -474,6 +584,7 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
                         await intestati_button.click()
                         await page.wait_for_load_state("networkidle", timeout=30000)
                         print(f"[VISURA] Intestati cliccato per risultato {result_index + 1}")
+                        await logger.log(page, f"intestati_r{result_index + 1}")
 
                         # Estrai tabella Elenco Intestati per questo risultato
                         print(f"[VISURA] Estraendo tabella Elenco Intestati per risultato {result_index + 1}...")
@@ -544,6 +655,7 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
                                     await indietro_button.click()
                                     await page.wait_for_load_state("networkidle", timeout=30000)
                                     print(f"[VISURA] Tornato indietro, pronto per risultato {result_index + 2}")
+                                    await logger.log(page, f"indietro_r{result_index + 1}")
                                 else:
                                     print("[VISURA] Bottone Indietro non trovato")
                                     break
@@ -598,9 +710,9 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
                 intestati_button = None
                 for selector in intestati_button_selectors:
                     try:
-                        button = page.locator(selector).first()
-                        if await button.count() > 0:
-                            intestati_button = button
+                        locator = page.locator(selector)
+                        if await locator.count() > 0:
+                            intestati_button = locator.first
                             print(f"[VISURA] Bottone Intestati trovato con selettore (fallback): {selector}")
                             break
                     except Exception as e:
@@ -611,6 +723,7 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
                     await intestati_button.click()
                     await page.wait_for_load_state("networkidle", timeout=30000)
                     print("[VISURA] Intestati cliccato (metodo originale)")
+                    await logger.log(page, "intestati_fallback")
 
                     # Estrai tabella Elenco Intestati
                     selectors = [
@@ -696,7 +809,9 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
 
 async def logout(page: Page):
     """Effettua il logout dal portale SISTER"""
+    logger = PageLogger("logout")
     try:
+        await logger.log(page, "before_logout")
         print("[LOGOUT] Cercando il bottone 'Esci'...")
         
         # Proviamo diversi selettori per il bottone di logout
@@ -720,7 +835,10 @@ async def logout(page: Page):
                 
                 if count > 0:
                     await logout_button.first.click()
-                    await page.wait_for_load_state("networkidle", timeout=10000)
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass  # Logout page may keep making requests; navigation already happened
                     print(f"[LOGOUT] Logout effettuato con successo usando selettore: {selector}")
                     logout_success = True
                     break
@@ -731,27 +849,14 @@ async def logout(page: Page):
         
         if not logout_success:
             print("[LOGOUT] ATTENZIONE: Non è stato possibile trovare il bottone 'Esci'")
-            # Debug: salviamo la pagina per analisi
-            try:
-                page_content = await page.content()
-                with open("/tmp/debug_logout.html", "w", encoding="utf-8") as f:
-                    f.write(page_content)
-                print("[LOGOUT] Contenuto pagina salvato in /tmp/debug_logout.html per debug")
-            except Exception as e:
-                print(f"[LOGOUT] Errore nel salvare debug: {e}")
+            await logger.log(page, "logout_bottone_non_trovato")
         else:
+            await logger.log(page, "after_logout")
             print("[LOGOUT] Sessione chiusa correttamente")
             
     except Exception as e:
         print(f"[LOGOUT] Errore durante il logout: {e}")
-        # Tentiamo comunque di salvare la pagina per debug
-        try:
-            page_content = await page.content()
-            with open("/tmp/debug_logout_error.html", "w", encoding="utf-8") as f:
-                f.write(page_content)
-            print("[LOGOUT] Contenuto pagina con errore salvato in /tmp/debug_logout_error.html")
-        except:
-            pass
+        await logger.log(page, "logout_errore")
 
 async def extract_all_sezioni(page: Page, tipo_catasto: str = 'T', max_province: int = 200) -> list:
     """
@@ -766,15 +871,17 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = 'T', max_province:
         Lista di dizionari con dati delle sezioni
     """
     sezioni_data = []
+    logger = PageLogger("sezioni")
     
     try:
         print(f"[SEZIONI] Iniziando estrazione sezioni per tipo catasto: {tipo_catasto} (max {max_province} province)")
         
         # Naviga alla pagina di scelta servizio
         print("[SEZIONI] Navigando alla pagina di scelta servizio...")
-        await page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
+        await page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
         await page.wait_for_load_state("networkidle", timeout=30000)
         print("[SEZIONI] Pagina caricata")
+        await logger.log(page, "scelta_servizio")
         
         # Estrai tutte le province
         print("[SEZIONI] Estraendo lista province...")
@@ -921,7 +1028,7 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = 'T', max_province:
                 
                 # Torna alla pagina principale per la prossima provincia
                 print("[SEZIONI] Tornando alla pagina principale per prossima provincia...")
-                await page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
+                await page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
                 await page.wait_for_load_state("networkidle", timeout=30000)
                 print("[SEZIONI] Tornato alla pagina principale")
                 
@@ -955,6 +1062,7 @@ async def run_visura_immobile(page, provincia='Trieste', comune='Trieste', sezio
         Dict con intestati dell'immobile specificato
     """
     time0 = time.time()
+    logger = PageLogger("visura_immobile")
     sezione_info = f", sezione={sezione}" if sezione else ", sezione=None"
     print(f"[VISURA_IMMOBILE] Inizio visura immobile: provincia={provincia}, comune={comune}{sezione_info}, foglio={foglio}, particella={particella}, subalterno={subalterno}")
     
@@ -963,9 +1071,10 @@ async def run_visura_immobile(page, provincia='Trieste', comune='Trieste', sezio
     
     # STEP 1: Selezione Ufficio Provinciale
     print("[VISURA_IMMOBILE] Navigando alla pagina di scelta servizio...")
-    await page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
+    await page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
     await page.wait_for_load_state("networkidle", timeout=30000)
     print("[VISURA_IMMOBILE] Pagina caricata")
+    await logger.log(page, "scelta_servizio")
     
     # Verifica che siamo realmente nella pagina di scelta servizio
     current_url = page.url
@@ -984,11 +1093,13 @@ async def run_visura_immobile(page, provincia='Trieste', comune='Trieste', sezio
     print("[VISURA_IMMOBILE] Cliccando Applica...")
     await page.locator("input[type='submit'][value='Applica']").click()
     await page.wait_for_load_state("networkidle", timeout=30000)
+    await logger.log(page, "provincia_applicata")
     
     # STEP 2: Ricerca per immobili
     print("[VISURA_IMMOBILE] Cliccando link Immobile...")
     await page.get_by_role("link", name="Immobile").click()
     await page.wait_for_load_state("networkidle", timeout=30000)
+    await logger.log(page, "immobile")
     
     # STEP 2.1: Seleziona tipo catasto FABBRICATI (F)
     print("[VISURA_IMMOBILE] Selezionando tipo catasto: F (Fabbricati)")
@@ -1049,6 +1160,7 @@ async def run_visura_immobile(page, provincia='Trieste', comune='Trieste', sezio
     print("[VISURA_IMMOBILE] Cliccando Ricerca...")
     await page.locator("input[name='scelta'][value='Ricerca']").click()
     await page.wait_for_load_state("networkidle", timeout=30000)
+    await logger.log(page, "ricerca")
     
     # STEP 3: Gestisci conferma assenza subalterno (se necessario)
     try:
@@ -1057,8 +1169,11 @@ async def run_visura_immobile(page, provincia='Trieste', comune='Trieste', sezio
             print("[VISURA_IMMOBILE] Rilevata richiesta conferma assenza subalterno...")
             await conferma_button.click()
             await page.wait_for_load_state("networkidle", timeout=30000)
+            await logger.log(page, "conferma_subalterno")
     except Exception as e:
         print(f"[VISURA_IMMOBILE] Errore o non necessaria conferma subalterno: {e}")
+    
+    await logger.log(page, "risultati")
     
     # STEP 4: Estrazione dati immobile (opzionale, principalmente per verifica)
     print("[VISURA_IMMOBILE] Estraendo dati immobile...")
@@ -1092,9 +1207,9 @@ async def run_visura_immobile(page, provincia='Trieste', comune='Trieste', sezio
         intestati_button = None
         for selector in intestati_button_selectors:
             try:
-                button = page.locator(selector).first()
-                if await button.count() > 0:
-                    intestati_button = button
+                locator = page.locator(selector)
+                if await locator.count() > 0:
+                    intestati_button = locator.first
                     print(f"[VISURA_IMMOBILE] Bottone Intestati trovato con selettore: {selector}")
                     break
             except Exception as e:
@@ -1105,6 +1220,7 @@ async def run_visura_immobile(page, provincia='Trieste', comune='Trieste', sezio
             await intestati_button.click()
             await page.wait_for_load_state("networkidle", timeout=30000)
             print("[VISURA_IMMOBILE] Intestati cliccato")
+            await logger.log(page, "intestati")
 
             # Estrai tabella Elenco Intestati
             print("[VISURA_IMMOBILE] Estraendo tabella Elenco Intestati...")

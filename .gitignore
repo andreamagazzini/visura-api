@@ -10,6 +10,9 @@ env/
 logs/
 *.log
 
+# HTML delle pagine catturate dal browser (dati sensibili)
+logs/pages/
+
 # Cache Python
 __pycache__/
 *.py[cod]
@@ -30,9 +33,6 @@ build/
 # Sistema operativo
 .DS_Store
 Thumbs.db
-
-# File di debug generati dall'applicazione
-/tmp/debug_*.html
 
 # Backup
 backup_original/
