@@ -1,0 +1,40 @@
+name: "✨ Feature Request"
+description: Proponi una nuova funzionalità o un miglioramento
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Grazie per la proposta! Prima di aprire questa issue, verifica che non esista già una richiesta simile.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problema o motivazione
+      description: Quale problema risolve questa funzionalità? Oppure perché sarebbe utile?
+      placeholder: "Mi trovo spesso a dover fare X manualmente, e sarebbe utile se..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Soluzione proposta
+      description: Descrivi la soluzione che immagini
+      placeholder: "Un nuovo endpoint che fa Y, oppure un parametro Z in /visura..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternative considerate
+      description: Hai considerato altre soluzioni? Se sì, perché le hai scartate?
+
+  - type: checkboxes
+    id: willingness
+    attributes:
+      label: Disponibilità a contribuire
+      options:
+        - label: Sono disponibile a implementare questa feature e aprire una PR

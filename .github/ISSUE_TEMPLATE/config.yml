@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "🔒 Vulnerabilità di sicurezza"
+    url: https://github.com/zornade/visura-api/security/advisories/new
+    about: "NON aprire issue pubbliche per problemi di sicurezza. Usa il Security Advisory."
+  - name: "💬 Domande e discussioni"
+    url: https://github.com/zornade/visura-api/discussions
+    about: "Per domande generali, usa le Discussions invece di aprire una issue."
