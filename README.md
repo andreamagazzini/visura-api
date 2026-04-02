@@ -8,7 +8,7 @@ Servizio REST per l'estrazione automatizzata di dati catastali dal portale **SIS
 
 > **Disclaimer legale** — Questo progetto è uno strumento indipendente e **non** è affiliato, approvato o supportato dall'Agenzia delle Entrate. L'utente è l'unico responsabile del rispetto dei termini di servizio del portale SISTER e della normativa vigente. L'uso di automazione sul portale potrebbe violare i termini d'uso del servizio.
 
-[!WARNING]  
+> [!WARNING]  
 > Per poter attivare le API bisogna **prima** registrarsi e chiedere l'accesso ai servizi sister utilizzando l'Area Personale di Agenzia delle Entrate e poi cercando "sister" tra i servizi disponibili. L'operazione è veloce.
 
 ---
