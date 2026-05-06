@@ -2,12 +2,66 @@ import os
 import re
 import time
 from datetime import datetime
+from typing import Optional
 
 from bs4 import BeautifulSoup
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-PAGES_LOG_DIR = "./logs/pages"
+DEFAULT_PAGES_LOG_DIR = "./logs/pages"
+FALLBACK_PAGES_LOG_DIR = "/tmp/visura-api/logs/pages"
+
+
+def _ensure_writable_dir(path: str) -> bool:
+    """Crea ``path`` (se serve) e verifica che sia scrivibile.
+
+    Esegue una scrittura di prova (``.write_probe``) e la rimuove. Restituisce
+    ``True`` solo se entrambe le operazioni hanno successo.
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe_path = os.path.join(path, ".write_probe")
+        with open(probe_path, "w", encoding="utf-8") as probe:
+            probe.write("ok")
+        os.remove(probe_path)
+        return True
+    except (PermissionError, OSError):
+        return False
+
+
+def _resolve_pages_log_dir() -> Optional[str]:
+    """Risolve una directory scrivibile per il logging delle pagine HTML.
+
+    Ordine di priorità:
+      1. variabile d'ambiente ``PAGES_LOG_DIR`` se valorizzata;
+      2. variabile di modulo ``PAGES_LOG_DIR`` (default ``./logs/pages``,
+         sovrascrivibile per test e configurazioni custom);
+      3. fallback ``/tmp/visura-api/logs/pages`` (utile in container con
+         filesystem applicativo read-only o senza volume montato);
+      4. ``None`` se nessuna directory è scrivibile (il logging viene disabilitato).
+    """
+    preferred_dir = os.getenv("PAGES_LOG_DIR") or PAGES_LOG_DIR
+    if _ensure_writable_dir(preferred_dir):
+        return preferred_dir
+
+    if _ensure_writable_dir(FALLBACK_PAGES_LOG_DIR):
+        print(
+            f"[PAGE_LOG] Directory '{preferred_dir}' non scrivibile, "
+            f"uso fallback '{FALLBACK_PAGES_LOG_DIR}'"
+        )
+        return FALLBACK_PAGES_LOG_DIR
+
+    print(
+        f"[PAGE_LOG] Nessuna directory scrivibile (provate: '{preferred_dir}', "
+        f"'{FALLBACK_PAGES_LOG_DIR}'). Logging delle pagine disabilitato."
+    )
+    return None
+
+
+# Compatibilità retroattiva: alcuni consumatori esterni potrebbero importare
+# o monkey-patchare PAGES_LOG_DIR. È usata da ``_resolve_pages_log_dir`` come
+# default se la variabile d'ambiente omonima non è impostata.
+PAGES_LOG_DIR = DEFAULT_PAGES_LOG_DIR
 
 
 def parse_table(html):
@@ -38,16 +92,22 @@ class PageLogger:
 
     _session_id: str = None
     _flow_counters: dict = {}
+    _pages_log_dir: Optional[str] = None
 
     @classmethod
     def reset_session(cls):
         """Resetta la sessione (da chiamare ad ogni avvio del server)."""
         cls._session_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         cls._flow_counters = {}
+        cls._pages_log_dir = None
 
     def __init__(self, flow_name: str):
         if PageLogger._session_id is None:
             PageLogger._session_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        # Risolvi la directory di log la prima volta che serve.
+        if PageLogger._pages_log_dir is None:
+            PageLogger._pages_log_dir = _resolve_pages_log_dir()
 
         # Contatore per differenziare flussi ripetuti (visura_002, visura_003…)
         count = PageLogger._flow_counters.get(flow_name, 0) + 1
@@ -57,12 +117,30 @@ class PageLogger:
         self.step = 0
 
         dir_name = flow_name if count == 1 else f"{flow_name}_{count:03d}"
-        self.base_dir = os.path.join(PAGES_LOG_DIR, PageLogger._session_id, dir_name)
-        os.makedirs(self.base_dir, exist_ok=True)
+
+        # Se nessuna directory è scrivibile, disabilita il logging silenziosamente:
+        # base_dir resta ``None`` e ``log()`` farà no-op.
+        if PageLogger._pages_log_dir is None:
+            self.base_dir: Optional[str] = None
+            return
+
+        self.base_dir = os.path.join(
+            PageLogger._pages_log_dir, PageLogger._session_id, dir_name
+        )
+        try:
+            os.makedirs(self.base_dir, exist_ok=True)
+        except (PermissionError, OSError) as e:
+            print(
+                f"[PAGE_LOG] Errore creando '{self.base_dir}': {e}. "
+                "Logging delle pagine disabilitato per questo flusso."
+            )
+            self.base_dir = None
 
     async def log(self, page: Page, step_name: str) -> None:
-        """Salva l'HTML corrente della pagina su disco."""
+        """Salva l'HTML corrente della pagina su disco (no-op se disabilitato)."""
         self.step += 1
+        if self.base_dir is None:
+            return
         try:
             if not page or page.is_closed():
                 print(f"[PAGE_LOG] {self.flow_name}/{step_name}: pagina chiusa, skip")

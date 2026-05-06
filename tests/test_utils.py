@@ -174,3 +174,52 @@ def test_page_logger_log_writes_html_file(monkeypatch, tmp_path):
     files = os.listdir(logger.base_dir)
     assert len(files) == 1
     assert files[0].startswith("01_step_with_spaces")
+
+
+def test_resolve_pages_log_dir_uses_env_var_when_set(monkeypatch, tmp_path):
+    target = tmp_path / "from-env"
+    monkeypatch.setenv("PAGES_LOG_DIR", str(target))
+    monkeypatch.setattr(utils, "PAGES_LOG_DIR", "/this/should/be/ignored")
+
+    resolved = utils._resolve_pages_log_dir()
+
+    assert resolved == str(target)
+    assert target.is_dir()
+
+
+def test_resolve_pages_log_dir_falls_back_when_preferred_unwritable(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("PAGES_LOG_DIR", raising=False)
+    monkeypatch.setattr(utils, "PAGES_LOG_DIR", "/proc/1/no-write-here")
+    fallback = tmp_path / "fallback-pages"
+    monkeypatch.setattr(utils, "FALLBACK_PAGES_LOG_DIR", str(fallback))
+
+    resolved = utils._resolve_pages_log_dir()
+
+    assert resolved == str(fallback)
+    assert fallback.is_dir()
+
+
+def test_resolve_pages_log_dir_returns_none_when_no_writable_dir(monkeypatch):
+    monkeypatch.delenv("PAGES_LOG_DIR", raising=False)
+    monkeypatch.setattr(utils, "PAGES_LOG_DIR", "/proc/1/preferred-bad")
+    monkeypatch.setattr(utils, "FALLBACK_PAGES_LOG_DIR", "/proc/1/fallback-bad")
+
+    resolved = utils._resolve_pages_log_dir()
+
+    assert resolved is None
+
+
+def test_page_logger_disabled_when_no_writable_dir(monkeypatch):
+    monkeypatch.delenv("PAGES_LOG_DIR", raising=False)
+    monkeypatch.setattr(utils, "PAGES_LOG_DIR", "/proc/1/preferred-bad")
+    monkeypatch.setattr(utils, "FALLBACK_PAGES_LOG_DIR", "/proc/1/fallback-bad")
+    utils.PageLogger.reset_session()
+
+    logger = utils.PageLogger("disabled-flow")
+
+    assert logger.base_dir is None
+    # ``log()`` deve essere no-op senza sollevare eccezioni
+    asyncio.run(logger.log(_FakePageOpen(), "any"))
+    assert logger.step == 1
