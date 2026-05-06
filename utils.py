@@ -45,10 +45,7 @@ def _resolve_pages_log_dir() -> Optional[str]:
         return preferred_dir
 
     if _ensure_writable_dir(FALLBACK_PAGES_LOG_DIR):
-        print(
-            f"[PAGE_LOG] Directory '{preferred_dir}' non scrivibile, "
-            f"uso fallback '{FALLBACK_PAGES_LOG_DIR}'"
-        )
+        print(f"[PAGE_LOG] Directory '{preferred_dir}' non scrivibile, " f"uso fallback '{FALLBACK_PAGES_LOG_DIR}'")
         return FALLBACK_PAGES_LOG_DIR
 
     print(
@@ -124,9 +121,7 @@ class PageLogger:
             self.base_dir: Optional[str] = None
             return
 
-        self.base_dir = os.path.join(
-            PageLogger._pages_log_dir, PageLogger._session_id, dir_name
-        )
+        self.base_dir = os.path.join(PageLogger._pages_log_dir, PageLogger._session_id, dir_name)
         try:
             os.makedirs(self.base_dir, exist_ok=True)
         except (PermissionError, OSError) as e:

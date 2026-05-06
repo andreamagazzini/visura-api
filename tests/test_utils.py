@@ -187,9 +187,7 @@ def test_resolve_pages_log_dir_uses_env_var_when_set(monkeypatch, tmp_path):
     assert target.is_dir()
 
 
-def test_resolve_pages_log_dir_falls_back_when_preferred_unwritable(
-    monkeypatch, tmp_path
-):
+def test_resolve_pages_log_dir_falls_back_when_preferred_unwritable(monkeypatch, tmp_path):
     monkeypatch.delenv("PAGES_LOG_DIR", raising=False)
     monkeypatch.setattr(utils, "PAGES_LOG_DIR", "/proc/1/no-write-here")
     fallback = tmp_path / "fallback-pages"
