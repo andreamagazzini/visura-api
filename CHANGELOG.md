@@ -24,6 +24,7 @@ e questo progetto aderisce al [Versionamento Semantico](https://semver.org/lang/
 - Filtro automatico immobili con partita "Soppressa"
 - Gestione risultati multipli con iterazione radio button
 - Nota sulla compatibilità SPID (solo CIE Sign / Sielte ID)
+- **Variabile d'ambiente `PAGES_LOG_DIR`** per configurare la directory di salvataggio degli HTML loggati dal browser. Se non impostata e la directory di default (`./logs/pages`) non è scrivibile, viene usato automaticamente `/tmp/visura-api/logs/pages`; se anche quella fallisce, il logging delle pagine viene disabilitato silenziosamente senza interrompere il servizio.
 
 ### Rimosso
 - Rimossa dipendenza da PostgreSQL / SQLAlchemy — il servizio ora è completamente stateless
@@ -34,3 +35,4 @@ e questo progetto aderisce al [Versionamento Semantico](https://semver.org/lang/
 ### Corretto
 - Rimosso `sys.exit(0)` duplicato nel gestore dei segnali
 - **Stabilità Docker**: rimosso flag Chromium `--single-process` (incompatibile con Docker, causava crash sporadici al re-init) e aggiunta chiusura esplicita dell'istanza Playwright precedente in `BrowserManager.initialize()` e `BrowserManager.close()` per evitare processi Chromium orfani durante session recovery e shutdown
+- **Robustezza `PageLogger`**: la creazione della directory di logging ora è tollerante ai filesystem read-only o privi di permessi di scrittura. La risoluzione avviene in cascata (`PAGES_LOG_DIR` env → variabile di modulo `PAGES_LOG_DIR` → fallback `/tmp/visura-api/logs/pages` → disabilitazione silenziosa), evitando crash all'avvio in container con application directory in sola lettura o senza volume montato.
