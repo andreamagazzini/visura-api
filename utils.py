@@ -159,6 +159,52 @@ class PageLogger:
             print(f"[PAGE_LOG] Errore salvataggio {step_name}: {e}")
 
 
+def _sister_still_on_iam_login(url: str) -> bool:
+    u = url.lower()
+    return "ui/login" in u or "/sam/ui/login" in u or "loginam" in u
+
+
+def _sister_login_error_in_page(body: str) -> bool:
+    b = body.lower()
+    phrases = (
+        "credenziali non corrette",
+        "utente o password",
+        "password errata",
+        "accesso negato",
+        "sessione scaduta",
+        "errore durante l'autenticazione",
+    )
+    return any(p in b for p in phrases)
+
+
+def _sister_login_confirmed(url: str, body: str) -> bool:
+    """True se risultiamo autenticati sul portale / Sister (non sulla sola pagina IAM login)."""
+    u, b = url.lower(), body.lower()
+    if "sister3.agenziaentrate.gov.it" in u:
+        return True
+    if "sister2.agenziaentrate.gov.it" in u:
+        return True
+    if "sister.agenziaentrate.gov.it" in u and "login" not in u:
+        return True
+    if "sceltaservizio" in u or "scelta_servizio" in u:
+        return True
+    if "mainal" in u and "agenziaentrate" in u and "login" not in u:
+        return True
+    if "servizi" in u and "sister" in u and "agenziaentrate" in u and not _sister_still_on_iam_login(u):
+        return True
+    if "closesessionssis" in b or "closesessionssis" in u:
+        return True
+    if "fa-sign-out" in b and "esci" in b:
+        return True
+    if "esci" in b and "sign-out" in b:
+        return True
+    if "logout" in b and not _sister_still_on_iam_login(u):
+        return True
+    if "esci" in b and "agenziaentrate" in u and not _sister_still_on_iam_login(u):
+        return True
+    return False
+
+
 async def login_sister_tab(page: Page):
     """Login tramite tab SISTER (username/password), senza flusso SPID/CIE."""
     ade_username = os.getenv("ADE_USERNAME")
@@ -318,15 +364,39 @@ async def login_sister_tab(page: Page):
                 await btn.click()
                 await page.wait_for_timeout(1200)
 
-        url = page.url.lower()
-        body = (await page.content()).lower()
-        if "sister3.agenziaentrate.gov.it" in url:
-            print("[LOGIN_SISTER] Sessione su portale SISTER rilevata.")
+        step = "verifica_sessione"
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+
+        poll_ms = int(os.getenv("SISTER_LOGIN_CONFIRM_TIMEOUT_MS", "60000"))
+        interval_ms = 1500
+        attempts = max(1, min(120, poll_ms // interval_ms))
+
+        for _ in range(attempts):
+            url = page.url
+            body = (await page.content()).lower()
+            if _sister_still_on_iam_login(url) and _sister_login_error_in_page(body):
+                raise Exception(
+                    "Login SISTER rifiutato dalla pagina IAM (credenziali errate o messaggio di errore visibile)."
+                )
+            if _sister_login_confirmed(url, body):
+                print("[LOGIN_SISTER] Sessione confermata.")
+                return
+            await page.wait_for_timeout(interval_ms)
+
+        url_final = page.url
+        body_final = (await page.content()).lower()
+        if _sister_login_confirmed(url_final, body_final):
+            print("[LOGIN_SISTER] Sessione confermata (ultimo controllo).")
             return
-        if "logout" in body or "esci" in body or "sister" in body:
-            print("[LOGIN_SISTER] Login completato (indicatori sessione presenti).")
-            return
-        raise Exception("Login SISTER non confermato automaticamente (verifica selettori o stato pagina).")
+        hint = url_final[:200] if len(url_final) > 200 else url_final
+        raise Exception(
+            "Login SISTER non confermato automaticamente: tempo scaduto o pagina inattesa. "
+            f"URL finale: {hint!r}. "
+            "Aumenta SISTER_LOGIN_CONFIRM_TIMEOUT_MS se il redirect è lento."
+        )
 
     except Exception:
         await logger.log(page, f"ERRORE_{step}")
