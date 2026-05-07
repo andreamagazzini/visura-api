@@ -179,29 +179,64 @@ async def login_sister_tab(page: Page):
         await logger.log(page, step)
 
         step = "sister_tab"
-        sister_tab = page.get_by_role("tab", name=re.compile(r"sister", re.I))
-        if await sister_tab.count():
-            await sister_tab.first.click()
+        # IAM "loginam" SPA: tutti i tab sono nel DOM; il primo input[type=text] è spesso il tab
+        # Fisconline (nascosto), quindi NON usare .first su input generici.
+        sister_selectors = (
+            'a[href="#tab-5"]',
+            'a.nav-link[aria-controls="tab-5"]',
+        )
+        for sel in sister_selectors:
+            tab = page.locator(sel).first
+            if await tab.count():
+                try:
+                    await tab.click()
+                    break
+                except Exception:
+                    pass
         else:
-            st = page.get_by_text(re.compile(r"sister", re.I)).first
-            if await st.count():
-                await st.click()
+            sister_tab = page.get_by_role("tab", name=re.compile(r"sister", re.I))
+            if await sister_tab.count():
+                await sister_tab.first.click()
+            else:
+                st = page.get_by_text(re.compile(r"^sister$", re.I)).first
+                if await st.count():
+                    await st.click()
         await page.wait_for_timeout(800)
 
+        sister_pane = page.locator("#tab-5")
+
         step = "username"
+        try:
+            await page.locator("#username-sister").wait_for(state="visible", timeout=20000)
+        except Exception:
+            await logger.log(page, f"wait_{step}")
         print("[LOGIN_SISTER] Inserisco credenziali...")
         filled = False
         for selector in (
+            "#username-sister",
+            "#tab-5 input#username-sister",
+            '#tab-5 input[name="IDToken1"]',
+            'input[id="username-sister"]',
+            'input[name="IDToken1"]',
             'input[name="username"]',
             'input[name="user"]',
             'input[autocomplete="username"]',
-            'input[type="text"]',
         ):
             loc = page.locator(selector).first
-            if await loc.count() and await loc.is_visible():
+            if await loc.count():
+                try:
+                    await loc.wait_for(state="visible", timeout=5000)
+                except Exception:
+                    continue
                 await loc.fill(ade_username)
                 filled = True
                 break
+        if not filled:
+            try:
+                await sister_pane.get_by_label(re.compile(r"utente", re.I)).first.fill(ade_username)
+                filled = True
+            except Exception:
+                pass
         if not filled:
             try:
                 await page.get_by_label(re.compile(r"username|utente|codice", re.I)).first.fill(ade_username)
@@ -212,25 +247,56 @@ async def login_sister_tab(page: Page):
             raise Exception("Campo username SISTER non trovato")
 
         step = "password"
-        pw = page.locator('input[type="password"]').first
-        if not await pw.count():
+        pw = None
+        for selector in (
+            "#password-fo-sist",
+            "#tab-5 input#password-fo-sist",
+            '#tab-5 input[name="IDToken2"]',
+            "#tab-5 input[type='password']",
+        ):
+            cand = page.locator(selector).first
+            if await cand.count():
+                try:
+                    await cand.wait_for(state="visible", timeout=5000)
+                except Exception:
+                    continue
+                pw = cand
+                break
+        if pw is None:
             raise Exception("Campo password SISTER non trovato")
         await pw.fill(ade_password)
 
         step = "submit"
         clicked = False
         for selector in (
-            'button[type="submit"]',
-            'input[type="submit"]',
+            "#tab-5 button.btn-primary",
+            '#tab-5 button[type="submit"]',
+            "#tab-5 .d-grid button",
+            'form:has(#username-sister) button[type="submit"]',
+            'form:has(#username-sister) button.btn-primary',
         ):
             btn = page.locator(selector).first
-            if await btn.count() and await btn.is_visible():
+            if await btn.count():
+                try:
+                    await btn.wait_for(state="visible", timeout=3000)
+                except Exception:
+                    continue
                 await btn.click()
                 clicked = True
                 break
         if not clicked:
+            for selector in (
+                'button[type="submit"]',
+                'input[type="submit"]',
+            ):
+                btn = sister_pane.locator(selector).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click()
+                    clicked = True
+                    break
+        if not clicked:
             for name in ("Accedi", "Entra", "Login", "Continua", "Prosegui"):
-                b = page.get_by_role("button", name=re.compile(name, re.I)).first
+                b = sister_pane.get_by_role("button", name=re.compile(name, re.I)).first
                 if await b.count() and await b.is_visible():
                     await b.click()
                     clicked = True
