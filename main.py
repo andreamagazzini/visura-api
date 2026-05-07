@@ -23,8 +23,9 @@ from utils import (
     run_visura_persona_fisica,
 )
 
-# Carica variabili d'ambiente da .env
+# Carica variabili d'ambiente: .env poi .env.local (override, tipico sviluppo locale)
 load_dotenv()
+load_dotenv(".env.local", override=True)
 
 # Configurazione logging
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()

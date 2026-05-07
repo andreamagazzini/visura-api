@@ -11,6 +11,32 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 _log = logging.getLogger(__name__)
 
+
+async def _safe_page_content(page: Page) -> str:
+    """Legge l'HTML evitando l'errore Playwright durante navigazioni/redirect in corso."""
+    last_err: Optional[Exception] = None
+    for attempt in range(15):
+        try:
+            return await page.content()
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            if "navigating" not in msg and "navigation" not in msg:
+                raise
+            _log.debug("playwright: page.content durante navigazione, retry %s/15", attempt + 1)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=20000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(350 + attempt * 80)
+    assert last_err is not None
+    raise last_err
+
+
+async def _safe_page_content_lower(page: Page) -> str:
+    return (await _safe_page_content(page)).lower()
+
+
 DEFAULT_PAGES_LOG_DIR = "./logs/pages"
 FALLBACK_PAGES_LOG_DIR = "/tmp/visura-api/logs/pages"
 
@@ -148,7 +174,7 @@ class PageLogger:
             except Exception:
                 pass
             url = page.url
-            html = await page.content()
+            html = await _safe_page_content(page)
             safe_name = re.sub(r"[^\w\-]", "_", step_name)
             filename = f"{self.step:02d}_{safe_name}.html"
             filepath = os.path.join(self.base_dir, filename)
@@ -420,7 +446,12 @@ async def login_sister_tab(page: Page):
 
         for _ in range(attempts):
             url = page.url
-            body = (await page.content()).lower()
+            try:
+                body = await _safe_page_content_lower(page)
+            except Exception as e:
+                _log.warning("login_sister_tab: lettura contenuto fallita in poll: %s", e)
+                await page.wait_for_timeout(interval_ms)
+                continue
             if _sister_still_on_iam_login(url) and _sister_login_error_in_page(body):
                 raise Exception(
                     "Login SISTER rifiutato dalla pagina IAM (credenziali errate o messaggio di errore visibile)."
@@ -431,7 +462,11 @@ async def login_sister_tab(page: Page):
             await page.wait_for_timeout(interval_ms)
 
         url_final = page.url
-        body_final = (await page.content()).lower()
+        try:
+            body_final = await _safe_page_content_lower(page)
+        except Exception as e:
+            _log.warning("login_sister_tab: lettura finale contenuto fallita: %s", e)
+            body_final = ""
         if _sister_login_confirmed(url_final, body_final):
             print("[LOGIN_SISTER] Sessione confermata (ultimo controllo).", flush=True)
             return
@@ -544,7 +579,7 @@ async def login(page: Page):
         await page.wait_for_load_state("networkidle")
         await logger.log(page, "vai_al_servizio")
         print("[LOGIN] Controllo blocco sessione...")
-        content = await page.content()
+        content = await _safe_page_content(page)
         url = page.url
         if "Utente gia' in sessione" in content or "error_locked.jsp" in url:
             print("[LOGIN][ERRORE] Utente già in sessione su un'altra postazione!")
@@ -681,7 +716,7 @@ async def run_visura(
         )
 
     # Verifica che la pagina sia stata caricata correttamente
-    content = await page.content()
+    content = await _safe_page_content(page)
     if "error" in content.lower() or "sessione scaduta" in content.lower() or "login" in content.lower():
         raise Exception(
             "La sessione sembra essere scaduta o si è verificato un errore durante il caricamento della pagina"

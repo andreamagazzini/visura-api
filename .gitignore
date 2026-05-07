@@ -5,6 +5,12 @@ env/
 
 # Variabili d'ambiente (contiene credenziali!)
 .env
+.env.local
+.env*.local
+.envlocal
+
+# Cursor / VS Code Local History e storico IDE
+.history/
 
 # Log
 logs/
