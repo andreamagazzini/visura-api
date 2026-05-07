@@ -159,7 +159,120 @@ class PageLogger:
             print(f"[PAGE_LOG] Errore salvataggio {step_name}: {e}")
 
 
+async def login_sister_tab(page: Page):
+    """Login tramite tab SISTER (username/password), senza flusso SPID/CIE."""
+    ade_username = os.getenv("ADE_USERNAME")
+    ade_password = os.getenv("ADE_PASSWORD")
+    login_url = os.getenv(
+        "SISTER_LOGIN_URL",
+        "https://iampe.agenziaentrate.gov.it/sam/UI/Login?realm=/agenziaentrate",
+    ).strip()
+
+    if not ade_username or not ade_password:
+        raise ValueError("ADE_USERNAME and ADE_PASSWORD environment variables must be set")
+
+    logger = PageLogger("login_sister_tab")
+    step = "goto_login"
+    try:
+        print("[LOGIN_SISTER] Navigo alla pagina di login...")
+        await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
+        await logger.log(page, step)
+
+        step = "sister_tab"
+        sister_tab = page.get_by_role("tab", name=re.compile(r"sister", re.I))
+        if await sister_tab.count():
+            await sister_tab.first.click()
+        else:
+            st = page.get_by_text(re.compile(r"sister", re.I)).first
+            if await st.count():
+                await st.click()
+        await page.wait_for_timeout(800)
+
+        step = "username"
+        print("[LOGIN_SISTER] Inserisco credenziali...")
+        filled = False
+        for selector in (
+            'input[name="username"]',
+            'input[name="user"]',
+            'input[autocomplete="username"]',
+            'input[type="text"]',
+        ):
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible():
+                await loc.fill(ade_username)
+                filled = True
+                break
+        if not filled:
+            try:
+                await page.get_by_label(re.compile(r"username|utente|codice", re.I)).first.fill(ade_username)
+                filled = True
+            except Exception:
+                pass
+        if not filled:
+            raise Exception("Campo username SISTER non trovato")
+
+        step = "password"
+        pw = page.locator('input[type="password"]').first
+        if not await pw.count():
+            raise Exception("Campo password SISTER non trovato")
+        await pw.fill(ade_password)
+
+        step = "submit"
+        clicked = False
+        for selector in (
+            'button[type="submit"]',
+            'input[type="submit"]',
+        ):
+            btn = page.locator(selector).first
+            if await btn.count() and await btn.is_visible():
+                await btn.click()
+                clicked = True
+                break
+        if not clicked:
+            for name in ("Accedi", "Entra", "Login", "Continua", "Prosegui"):
+                b = page.get_by_role("button", name=re.compile(name, re.I)).first
+                if await b.count() and await b.is_visible():
+                    await b.click()
+                    clicked = True
+                    break
+        if not clicked:
+            raise Exception("Pulsante login SISTER non trovato")
+
+        await page.wait_for_timeout(3000)
+
+        step = "conferme"
+        for selector in (
+            "button:has-text('Conferma')",
+            "a:has-text('Conferma')",
+            "a:has-text('Conferma Lettura')",
+            "input[value='Conferma']",
+        ):
+            btn = page.locator(selector).first
+            if await btn.count() and await btn.is_visible():
+                await btn.click()
+                await page.wait_for_timeout(1200)
+
+        url = page.url.lower()
+        body = (await page.content()).lower()
+        if "sister3.agenziaentrate.gov.it" in url:
+            print("[LOGIN_SISTER] Sessione su portale SISTER rilevata.")
+            return
+        if "logout" in body or "esci" in body or "sister" in body:
+            print("[LOGIN_SISTER] Login completato (indicatori sessione presenti).")
+            return
+        raise Exception("Login SISTER non confermato automaticamente (verifica selettori o stato pagina).")
+
+    except Exception:
+        await logger.log(page, f"ERRORE_{step}")
+        raise
+
+
 async def login(page: Page):
+    login_method = os.getenv("LOGIN_METHOD", "spid").strip().lower()
+    if login_method in ("sister", "sister_tab"):
+        await login_sister_tab(page)
+        return
+
     ade_username = os.getenv("ADE_USERNAME")
     ade_password = os.getenv("ADE_PASSWORD")
 
@@ -737,45 +850,316 @@ async def run_visura(
     return result
 
 
-async def logout(page: Page):
-    """Effettua il logout dal portale SISTER"""
+async def _pf_select_option_contains(page, selector: str, label_text: str) -> None:
+    """Seleziona un'opzione il cui testo contiene label_text (case-insensitive)."""
+    if not label_text or not str(label_text).strip():
+        return
+    wanted = str(label_text).strip().lower()
+    sel = page.locator(selector).first
+    if not await sel.count():
+        return
+    options = await sel.locator("option").all()
+    for option in options:
+        text = (await option.inner_text() or "").strip().lower()
+        if wanted in text or text in wanted:
+            value = await option.get_attribute("value")
+            if value:
+                await sel.select_option(value)
+                return
+    try:
+        await sel.select_option(label=label_text.strip())
+    except Exception:
+        pass
+
+
+async def run_visura_persona_fisica(
+    page,
+    provincia: str,
+    pf_tipo_catasto: Optional[str] = None,
+    pf_comune_catastale: Optional[str] = None,
+    pf_search_by: str = "cognome",
+    pf_cognome: Optional[str] = None,
+    pf_nome: Optional[str] = None,
+    pf_codice_fiscale: Optional[str] = None,
+    pf_birth_day: Optional[str] = None,
+    pf_birth_month: Optional[str] = None,
+    pf_birth_year: Optional[str] = None,
+    pf_sesso: Optional[str] = None,
+    pf_birth_province: Optional[str] = None,
+    pf_tipo_ispezione: str = "R",
+    pf_limitata: Optional[str] = None,
+    tipo_richiesta: str = "A",
+    richiedente: Optional[str] = None,
+    motivo: Optional[str] = None,
+):
+    """Visura per persona fisica: elenco beni catastali (stesso percorso UI del client TypeScript)."""
+    time0 = time.time()
+    logger = PageLogger("visura_pf")
+    print(f"[VISURA_PF] Inizio ricerca PF: provincia_ufficio={provincia}, search_by={pf_search_by}")
+
+    await page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    await logger.log(page, "scelta_servizio")
+
+    current_url = page.url
+    if "SceltaServizio.do" not in current_url:
+        raise Exception(f"Sessione non valida o URL imprevisto: {current_url}")
+
+    if await page.locator("select[name='listacom'] option").count() <= 1:
+        raise Exception("Sessione scaduta: province non disponibili")
+
+    provincia_value = await find_best_option_match(page, "select[name='listacom']", provincia)
+    if not provincia_value:
+        raise Exception(f"Provincia ufficio '{provincia}' non trovata")
+
+    await page.locator("select[name='listacom']").select_option(provincia_value)
+    await page.locator("input[type='submit'][value='Applica']").click()
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    await logger.log(page, "provincia_applicata")
+
+    pf_link = page.locator("a[href*='lista=PF']").first
+    if await pf_link.count():
+        await pf_link.click()
+        await page.wait_for_timeout(1200)
+    else:
+        alt = page.get_by_role("link", name=re.compile(r"persona", re.I)).first
+        if await alt.count():
+            await alt.click()
+            await page.wait_for_timeout(1200)
+        else:
+            raise Exception("Link ricerca Persona fisica non trovato")
+    await logger.log(page, "persona_fisica")
+
+    if pf_tipo_catasto:
+        catasto = page.locator("select[name='tipoCatasto']").first
+        if await catasto.count():
+            await catasto.select_option(pf_tipo_catasto)
+
+    if pf_comune_catastale and str(pf_comune_catastale).strip():
+        await _pf_select_option_contains(page, "select[name='comuneCat']", pf_comune_catastale.strip())
+
+    search_by = (pf_search_by or "cognome").lower()
+    if search_by == "cf":
+        cf_radio = page.locator("input[name='selDatiAna'][value='CF_PF']").first
+        if await cf_radio.count():
+            await cf_radio.check()
+        for sel in ('input[name="cod_fisc_pf"]', "input#cf"):
+            loc = page.locator(sel).first
+            if await loc.count():
+                await loc.fill((pf_codice_fiscale or "").strip())
+                break
+    else:
+        cog_radio = page.locator("input[name='selDatiAna'][value='cognome']").first
+        if await cog_radio.count():
+            await cog_radio.check()
+        if pf_cognome and str(pf_cognome).strip():
+            for sel in ('input[name="cognome"]', "input#cognome"):
+                loc = page.locator(sel).first
+                if await loc.count():
+                    await loc.fill(pf_cognome.strip())
+                    break
+        if pf_nome and str(pf_nome).strip():
+            for sel in ('input[name="nome"]', "input#nome"):
+                loc = page.locator(sel).first
+                if await loc.count():
+                    await loc.fill(pf_nome.strip())
+                    break
+
+    if pf_birth_day and str(pf_birth_day).strip():
+        for sel in ('input[name="gg_nascita"]', "input#giorno"):
+            loc = page.locator(sel).first
+            if await loc.count():
+                await loc.fill(pf_birth_day.strip())
+                break
+    if pf_birth_month and str(pf_birth_month).strip():
+        for sel in ('input[name="mm_nascita"]', "input#mese"):
+            loc = page.locator(sel).first
+            if await loc.count():
+                await loc.fill(pf_birth_month.strip())
+                break
+    if pf_birth_year and str(pf_birth_year).strip():
+        for sel in ('input[name="anno_nascita"]', "input#anno"):
+            loc = page.locator(sel).first
+            if await loc.count():
+                await loc.fill(pf_birth_year.strip())
+                break
+
+    if pf_sesso in ("M", "F"):
+        sesso = page.locator("select[name='sesso']").first
+        if await sesso.count():
+            await sesso.select_option(pf_sesso)
+
+    if pf_birth_province and str(pf_birth_province).strip():
+        prov = page.locator("select[name='provincia_amm_pf']").first
+        if await prov.count():
+            try:
+                await prov.select_option(pf_birth_province.strip())
+            except Exception:
+                await _pf_select_option_contains(page, "select[name='provincia_amm_pf']", pf_birth_province)
+
+    ti = pf_tipo_ispezione or "R"
+    tir = page.locator(f"input[name='tipo_ispezione_pf'][value='{ti}']").first
+    if await tir.count():
+        await tir.check()
+    if ti == "L" and pf_limitata in ("0", "1", "2"):
+        lim = page.locator("select[name='limitata']").first
+        if await lim.count():
+            await lim.select_option(pf_limitata)
+
+    tr = tipo_richiesta or "A"
+    tr_loc = page.locator(f"input[name='tipo_richiesta'][value='{tr}']").first
+    if await tr_loc.count():
+        await tr_loc.check()
+
+    if richiedente and str(richiedente).strip():
+        r = page.locator('input[name="richiedente"]').first
+        if await r.count():
+            await r.fill(richiedente.strip())
+    if motivo and str(motivo).strip():
+        m = page.locator('input[name="motivoText"]').first
+        if await m.count():
+            await m.fill(motivo.strip())
+
+    await page.locator("input[name='scelta'][value='Ricerca']").click()
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    await logger.log(page, "ricerca_pf")
+
+    page_text = await page.inner_text("body")
+    if "NESSUNA CORRISPONDENZA TROVATA" in page_text:
+        return {
+            "results": [],
+            "total_results": 0,
+            "search_mode": "PF",
+            "error": "NESSUNA CORRISPONDENZA TROVATA",
+        }
+
+    rows = []
+    table = page.locator("table.listaIsp4").first
+    if await table.count():
+        try:
+            rows = await table.evaluate(
+                """(el) => {
+                const headerCells = Array.from(el.querySelectorAll("tr th"));
+                const headers = headerCells.map((cell) => (cell.textContent || "").trim());
+                const dataRows = Array.from(el.querySelectorAll("tr")).slice(1);
+                return dataRows.map((row) => {
+                    const cells = Array.from(row.querySelectorAll("td"));
+                    if (!cells.length) return null;
+                    const record = {};
+                    cells.forEach((cell, idx) => {
+                        const key = headers[idx] || ("col_" + (idx + 1));
+                        record[key] = (cell.textContent || "").trim();
+                    });
+                    return record;
+                }).filter(Boolean);
+            }"""
+            )
+        except Exception:
+            rows = []
+    if not rows and await table.count():
+        immobili_html = await table.inner_html()
+        rows = parse_table(immobili_html) if immobili_html else []
+
+    time1 = time.time()
+    print(f"[VISURA_PF] Completata in {time1 - time0:.2f}s, {len(rows)} righe")
+    return {
+        "results": rows,
+        "total_results": len(rows),
+        "search_mode": "PF",
+        "error": None,
+    }
+
+
+async def logout(page: Page) -> bool:
+    """Effettua il logout dal portale SISTER. Restituisce True se è stato cliccato un controllo Esci."""
     logger = PageLogger("logout")
+    logout_success = False
     try:
         await logger.log(page, "before_logout")
-        print("[LOGOUT] Cercando il bottone 'Esci'...")
+        print("[LOGOUT] Navigazione alla scelta servizio (logout affidabile)...")
+        try:
+            await page.goto(
+                "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_",
+                timeout=60000,
+            )
+            await page.wait_for_load_state("networkidle", timeout=30000)
+        except Exception as e:
+            print(f"[LOGOUT] Navigazione pre-logout fallita (continuo con pagina corrente): {e}")
+
+        print("[LOGOUT] Cercando il bottone/link 'Esci'...")
+        # Link reale SISTER: <a class="btn btn-primary" href=".../Servizi/CloseSessionsSis">…Esci</a>
+        try:
+            close_sessions = page.locator('a[href*="CloseSessionsSis"]')
+            if await close_sessions.count():
+                await close_sessions.first.click()
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                print("[LOGOUT] Click su link CloseSessionsSis (href ufficiale)")
+                logout_success = True
+        except Exception as e:
+            print(f"[LOGOUT] CloseSessionsSis non cliccabile: {e}")
+
+        if not logout_success:
+            try:
+                esci_link = page.get_by_role("link", name=re.compile(r"Esci", re.I))
+                if await esci_link.count():
+                    await esci_link.first.click()
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+                    print("[LOGOUT] Click su link Esci (role)")
+                    logout_success = True
+            except Exception as e:
+                print(f"[LOGOUT] Role link Esci non disponibile: {e}")
+
+        if not logout_success:
+            try:
+                esci_btn = page.get_by_role("button", name=re.compile(r"Esci", re.I))
+                if await esci_btn.count():
+                    await esci_btn.first.click()
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+                    print("[LOGOUT] Click su button Esci (role)")
+                    logout_success = True
+            except Exception as e:
+                print(f"[LOGOUT] Role button Esci non disponibile: {e}")
 
         # Proviamo diversi selettori per il bottone di logout
         logout_selectors = [
-            "input[value='Esci']",  # Input con value Esci
-            "button:has-text('Esci')",  # Button che contiene il testo Esci
-            "a:has-text('Esci')",  # Link che contiene il testo Esci
-            "input[type='submit'][value*='Esci']",  # Input submit che contiene Esci
-            "*[onclick*='logout']",  # Qualsiasi elemento con onclick che contiene logout
-            "*[onclick*='Esci']",  # Qualsiasi elemento con onclick che contiene Esci
+            "input[value='Esci']",
+            "button:has-text('Esci')",
+            "a:has-text('Esci')",
+            "input[type='submit'][value*='Esci']",
+            "*[onclick*='logout']",
+            "*[onclick*='Esci']",
         ]
 
-        logout_success = False
+        if not logout_success:
+            for selector in logout_selectors:
+                try:
+                    print(f"[LOGOUT] Tentativo selettore: {selector}")
+                    logout_button = page.locator(selector)
+                    count = await logout_button.count()
+                    print(f"[LOGOUT] Trovati {count} elementi con selettore {selector}")
 
-        for selector in logout_selectors:
-            try:
-                print(f"[LOGOUT] Tentativo selettore: {selector}")
-                logout_button = page.locator(selector)
-                count = await logout_button.count()
-                print(f"[LOGOUT] Trovati {count} elementi con selettore {selector}")
+                    if count > 0:
+                        await logout_button.first.click()
+                        try:
+                            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                        except Exception:
+                            pass
+                        print(f"[LOGOUT] Logout effettuato con selettore: {selector}")
+                        logout_success = True
+                        break
 
-                if count > 0:
-                    await logout_button.first.click()
-                    try:
-                        await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                    except Exception:
-                        pass  # Logout page may keep making requests; navigation already happened
-                    print(f"[LOGOUT] Logout effettuato con successo usando selettore: {selector}")
-                    logout_success = True
-                    break
-
-            except Exception as e:
-                print(f"[LOGOUT] Errore con selettore {selector}: {e}")
-                continue
+                except Exception as e:
+                    print(f"[LOGOUT] Errore con selettore {selector}: {e}")
+                    continue
 
         if not logout_success:
             print("[LOGOUT] ATTENZIONE: Non è stato possibile trovare il bottone 'Esci'")
@@ -784,9 +1168,12 @@ async def logout(page: Page):
             await logger.log(page, "after_logout")
             print("[LOGOUT] Sessione chiusa correttamente")
 
+        return logout_success
+
     except Exception as e:
         print(f"[LOGOUT] Errore durante il logout: {e}")
         await logger.log(page, "logout_errore")
+        return False
 
 
 async def extract_all_sezioni(page: Page, tipo_catasto: str = "T", max_province: int = 200) -> list:

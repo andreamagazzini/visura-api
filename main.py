@@ -5,15 +5,23 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from pydantic import BaseModel, Field, validator
 
-from utils import PageLogger, extract_all_sezioni, login, logout, run_visura, run_visura_immobile
+from utils import (
+    PageLogger,
+    extract_all_sezioni,
+    login,
+    logout,
+    run_visura,
+    run_visura_immobile,
+    run_visura_persona_fisica,
+)
 
 # Carica variabili d'ambiente da .env
 load_dotenv()
@@ -100,6 +108,36 @@ class VisuraIntestatiRequest:
 
 
 @dataclass
+class VisuraPersonaFisicaRequest:
+    """Ricerca visura per persona fisica (beni catastali)."""
+
+    request_id: str
+    provincia: str
+    comune: str
+    pf_tipo_catasto: Optional[str] = None
+    pf_comune_catastale: Optional[str] = None
+    pf_search_by: str = "cognome"
+    pf_cognome: Optional[str] = None
+    pf_nome: Optional[str] = None
+    pf_codice_fiscale: Optional[str] = None
+    pf_birth_day: Optional[str] = None
+    pf_birth_month: Optional[str] = None
+    pf_birth_year: Optional[str] = None
+    pf_sesso: Optional[str] = None
+    pf_birth_province: Optional[str] = None
+    pf_tipo_ispezione: str = "R"
+    pf_limitata: Optional[str] = None
+    tipo_richiesta: str = "A"
+    richiedente: Optional[str] = None
+    motivo: Optional[str] = None
+    timestamp: datetime = None
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.now()
+
+
+@dataclass
 class VisuraResponse:
     request_id: str
     success: bool
@@ -122,6 +160,8 @@ class BrowserManager:
         self.authenticated = False
         self.keep_alive_running = False
         self.last_login_time = None
+        self._session_lock = asyncio.Lock()
+        self._keep_alive_task: Optional[asyncio.Task] = None
 
     async def initialize(self):
         """Inizializza il browser e il contexto"""
@@ -182,31 +222,43 @@ class BrowserManager:
             raise AuthenticationError(f"Login failed: {e}") from e
 
     async def start_keep_alive(self):
-        """Mantiene la sessione attiva con attività realistiche"""
+        """Avvia un solo worker keep-alive (annulla eventuale task precedente)."""
+        await self._cancel_keep_alive_task()
         self.keep_alive_running = True
+        self._keep_alive_task = asyncio.create_task(self._keep_alive_loop())
 
-        async def keep_alive_worker():
-            last_check = datetime.now()
-            while self.keep_alive_running:
-                try:
-                    if self.auth_page and not self.auth_page.is_closed():
-                        current_time = datetime.now()
+    async def _keep_alive_loop(self):
+        last_check = datetime.now()
+        while self.keep_alive_running:
+            try:
+                if self.auth_page and not self.auth_page.is_closed():
+                    current_time = datetime.now()
 
-                        # Ogni 5 minuti, fai una verifica più approfondita
-                        if (current_time - last_check).total_seconds() > 300:
-                            await self._perform_session_refresh()
-                            last_check = current_time
-                        else:
-                            # Keep-alive leggero ogni 30 secondi
-                            await self._perform_light_keepalive()
+                    if (current_time - last_check).total_seconds() > 300:
+                        await self._perform_session_refresh()
+                        last_check = current_time
+                    else:
+                        await self._perform_light_keepalive()
 
-                    await asyncio.sleep(30)
+                await asyncio.sleep(30)
 
-                except Exception as e:
-                    logger.error(f"Errore in keep-alive: {e}")
-                    await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Errore in keep-alive: {e}")
+                await asyncio.sleep(60)
 
-        asyncio.create_task(keep_alive_worker())
+    async def _cancel_keep_alive_task(self):
+        self.keep_alive_running = False
+        if self._keep_alive_task and not self._keep_alive_task.done():
+            self._keep_alive_task.cancel()
+            try:
+                await self._keep_alive_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"Errore cancellazione keep-alive: {e}")
+        self._keep_alive_task = None
 
     async def _perform_light_keepalive(self):
         """Keep-alive leggero: movimento del mouse"""
@@ -248,8 +300,59 @@ class BrowserManager:
             return False
 
     async def stop_keep_alive(self):
-        """Ferma il keep-alive"""
-        self.keep_alive_running = False
+        """Ferma il keep-alive e attende la terminazione del task."""
+        await self._cancel_keep_alive_task()
+
+    async def session_logout(self) -> Dict[str, Any]:
+        """Logout esplicito sul portale ADE/SISTER senza chiudere Chromium.
+
+        Se il click su Esci non viene rilevato, pulisce i cookie del context per evitare
+        sessioni fantasma che bloccano un nuovo accesso (\"utente già in sessione\").
+        """
+        async with self._session_lock:
+            await self._cancel_keep_alive_task()
+
+            logout_ok = False
+            if self.auth_page and not self.auth_page.is_closed():
+                try:
+                    logout_ok = await logout(self.auth_page)
+                except Exception as e:
+                    logger.warning(f"Eccezione durante logout UI: {e}")
+
+                try:
+                    await self.auth_page.close()
+                except Exception as e:
+                    logger.warning(f"Errore chiusura pagina post-logout: {e}")
+
+            self.auth_page = None
+            self.authenticated = False
+
+            cookies_cleared = False
+            if self.context and not logout_ok:
+                try:
+                    await self.context.clear_cookies()
+                    cookies_cleared = True
+                    logger.info("Cookie del browser context cancellati dopo logout non confermato da UI")
+                except Exception as e:
+                    logger.warning(f"Pulizia cookie fallita: {e}")
+
+            return {
+                "logout_ui_confirmed": logout_ok,
+                "cookies_cleared": cookies_cleared,
+                "authenticated": False,
+                "message": "Sessione locale terminata; sul portale usa sempre Esci quando possibile.",
+            }
+
+    async def session_login(self) -> Dict[str, Any]:
+        """Riesegue il login (stesso flusso dell'avvio: SPID o sister_tab da LOGIN_METHOD)."""
+        async with self._session_lock:
+            await self._cancel_keep_alive_task()
+            await self.login()
+            await self.start_keep_alive()
+            return {
+                "authenticated": self.authenticated,
+                "message": "Login completato.",
+            }
 
     async def _check_session_validity(self):
         """Verifica se la sessione è ancora valida"""
@@ -368,92 +471,147 @@ class BrowserManager:
 
     async def esegui_visura(self, request: VisuraRequest) -> VisuraResponse:
         """Esegue una visura catastale (solo dati catastali, senza intestati)"""
-        try:
-            await self._ensure_authenticated()
-
+        async with self._session_lock:
             try:
-                result = await run_visura(
-                    self.auth_page,
-                    request.provincia,
-                    request.comune,
-                    request.sezione,
-                    request.foglio,
-                    request.particella,
-                    request.tipo_catasto,
-                    extract_intestati=False,
-                    subalterno=request.subalterno,
+                await self._ensure_authenticated()
+
+                try:
+                    result = await run_visura(
+                        self.auth_page,
+                        request.provincia,
+                        request.comune,
+                        request.sezione,
+                        request.foglio,
+                        request.particella,
+                        request.tipo_catasto,
+                        extract_intestati=False,
+                        subalterno=request.subalterno,
+                    )
+                except Exception as e:
+                    raise BrowserError(f"Failed to execute visura: {e}") from e
+
+                logger.info(f"Visura completata per request {request.request_id}")
+                return VisuraResponse(
+                    request_id=request.request_id,
+                    success=True,
+                    tipo_catasto=request.tipo_catasto,
+                    data=result,
+                )
+
+            except (AuthenticationError, BrowserError) as e:
+                logger.error(f"Errore in visura {request.request_id}: {e}")
+                return VisuraResponse(
+                    request_id=request.request_id,
+                    success=False,
+                    tipo_catasto=request.tipo_catasto,
+                    error=str(e),
                 )
             except Exception as e:
-                raise BrowserError(f"Failed to execute visura: {e}") from e
-
-            logger.info(f"Visura completata per request {request.request_id}")
-            return VisuraResponse(
-                request_id=request.request_id,
-                success=True,
-                tipo_catasto=request.tipo_catasto,
-                data=result,
-            )
-
-        except (AuthenticationError, BrowserError) as e:
-            logger.error(f"Errore in visura {request.request_id}: {e}")
-            return VisuraResponse(
-                request_id=request.request_id,
-                success=False,
-                tipo_catasto=request.tipo_catasto,
-                error=str(e),
-            )
-        except Exception as e:
-            logger.error(f"Errore inatteso in visura {request.request_id}: {e}")
-            return VisuraResponse(
-                request_id=request.request_id,
-                success=False,
-                tipo_catasto=request.tipo_catasto,
-                error=f"Errore inatteso: {str(e)}",
-            )
+                logger.error(f"Errore inatteso in visura {request.request_id}: {e}")
+                return VisuraResponse(
+                    request_id=request.request_id,
+                    success=False,
+                    tipo_catasto=request.tipo_catasto,
+                    error=f"Errore inatteso: {str(e)}",
+                )
 
     async def esegui_visura_intestati(self, request: VisuraIntestatiRequest) -> VisuraResponse:
         """Esegue una visura per ottenere gli intestati di un immobile specifico."""
-        try:
-            await self._ensure_authenticated()
+        async with self._session_lock:
+            try:
+                await self._ensure_authenticated()
 
-            if request.tipo_catasto == "F" and request.subalterno:
-                result = await run_visura_immobile(
+                if request.tipo_catasto == "F" and request.subalterno:
+                    result = await run_visura_immobile(
+                        self.auth_page,
+                        provincia=request.provincia,
+                        comune=request.comune,
+                        sezione=request.sezione,
+                        foglio=request.foglio,
+                        particella=request.particella,
+                        subalterno=request.subalterno,
+                    )
+                else:
+                    result = await run_visura(
+                        self.auth_page,
+                        request.provincia,
+                        request.comune,
+                        request.sezione,
+                        request.foglio,
+                        request.particella,
+                        request.tipo_catasto,
+                        extract_intestati=True,
+                    )
+
+                logger.info(f"Visura intestati completata per {request.request_id}")
+                return VisuraResponse(
+                    request_id=request.request_id,
+                    success=True,
+                    tipo_catasto=request.tipo_catasto,
+                    data=result,
+                )
+
+            except Exception as e:
+                logger.error(f"Errore in visura intestati {request.request_id}: {e}")
+                return VisuraResponse(
+                    request_id=request.request_id,
+                    success=False,
+                    tipo_catasto=request.tipo_catasto,
+                    error=str(e),
+                )
+
+    async def esegui_visura_persona_fisica(self, request: VisuraPersonaFisicaRequest) -> VisuraResponse:
+        """Ricerca beni per persona fisica (codice fiscale o anagrafica)."""
+        pf_label = "PF"
+        async with self._session_lock:
+            try:
+                await self._ensure_authenticated()
+
+                result = await run_visura_persona_fisica(
                     self.auth_page,
                     provincia=request.provincia,
-                    comune=request.comune,
-                    sezione=request.sezione,
-                    foglio=request.foglio,
-                    particella=request.particella,
-                    subalterno=request.subalterno,
-                )
-            else:
-                result = await run_visura(
-                    self.auth_page,
-                    request.provincia,
-                    request.comune,
-                    request.sezione,
-                    request.foglio,
-                    request.particella,
-                    request.tipo_catasto,
-                    extract_intestati=True,
+                    pf_tipo_catasto=request.pf_tipo_catasto,
+                    pf_comune_catastale=request.pf_comune_catastale,
+                    pf_search_by=request.pf_search_by or "cognome",
+                    pf_cognome=request.pf_cognome,
+                    pf_nome=request.pf_nome,
+                    pf_codice_fiscale=request.pf_codice_fiscale,
+                    pf_birth_day=request.pf_birth_day,
+                    pf_birth_month=request.pf_birth_month,
+                    pf_birth_year=request.pf_birth_year,
+                    pf_sesso=request.pf_sesso,
+                    pf_birth_province=request.pf_birth_province,
+                    pf_tipo_ispezione=request.pf_tipo_ispezione or "R",
+                    pf_limitata=request.pf_limitata,
+                    tipo_richiesta=request.tipo_richiesta or "A",
+                    richiedente=request.richiedente,
+                    motivo=request.motivo,
                 )
 
-            logger.info(f"Visura intestati completata per {request.request_id}")
-            return VisuraResponse(
-                request_id=request.request_id,
-                success=True,
-                tipo_catasto=request.tipo_catasto,
-                data=result,
-            )
+                logger.info(f"Visura PF completata per {request.request_id}")
+                return VisuraResponse(
+                    request_id=request.request_id,
+                    success=True,
+                    tipo_catasto=pf_label,
+                    data=result,
+                )
 
-        except Exception as e:
-            logger.error(f"Errore in visura intestati {request.request_id}: {e}")
-            return VisuraResponse(
-                request_id=request.request_id,
-                success=False,
-                tipo_catasto=request.tipo_catasto,
-                error=str(e),
-            )
+            except (AuthenticationError, BrowserError) as e:
+                logger.error(f"Errore in visura PF {request.request_id}: {e}")
+                return VisuraResponse(
+                    request_id=request.request_id,
+                    success=False,
+                    tipo_catasto=pf_label,
+                    error=str(e),
+                )
+            except Exception as e:
+                logger.error(f"Errore inatteso in visura PF {request.request_id}: {e}")
+                return VisuraResponse(
+                    request_id=request.request_id,
+                    success=False,
+                    tipo_catasto=pf_label,
+                    error=str(e),
+                )
 
     async def restart_browser_if_needed(self):
         """Riavvia il browser se necessario"""
@@ -548,6 +706,11 @@ class VisuraService:
                     self.response_store[request.request_id] = response
                     logger.info(f"Processata richiesta intestati {request.request_id}")
 
+                elif isinstance(request, VisuraPersonaFisicaRequest):
+                    response = await self.browser_manager.esegui_visura_persona_fisica(request)
+                    self.response_store[request.request_id] = response
+                    logger.info(f"Processata richiesta visura PF {request.request_id}")
+
                 else:
                     logger.error(f"Tipo di richiesta sconosciuto: {type(request)}")
 
@@ -576,6 +739,14 @@ class VisuraService:
         )
         return request.request_id
 
+    async def add_persona_fisica_request(self, request: VisuraPersonaFisicaRequest) -> str:
+        """Aggiunge una richiesta visura persona fisica alla coda"""
+        await self.request_queue.put({"request": request})
+        logger.info(
+            f"Richiesta visura PF {request.request_id} aggiunta alla coda (posizione: {self.request_queue.qsize()})"
+        )
+        return request.request_id
+
     async def get_response(self, request_id: str) -> Optional[VisuraResponse]:
         """Ottiene la risposta per un request_id"""
         return self.response_store.get(request_id)
@@ -591,6 +762,14 @@ class VisuraService:
         self.processing = False
         await self.browser_manager.graceful_shutdown()
         logger.info("Graceful shutdown del servizio completato")
+
+    async def session_logout(self) -> Dict[str, Any]:
+        """Logout esplicito sul portale (senza chiudere il processo)."""
+        return await self.browser_manager.session_logout()
+
+    async def session_login(self) -> Dict[str, Any]:
+        """Login esplicito (riusa LOGIN_METHOD da ambiente)."""
+        return await self.browser_manager.session_login()
 
 
 # Global service instance - initialized during lifespan
@@ -690,6 +869,35 @@ class SezioniExtractionRequest(BaseModel):
     )
 
 
+class VisuraPersonaFisicaInput(BaseModel):
+    """Ricerca beni catastali per persona fisica (codice fiscale o anagrafica)."""
+
+    provincia: str = Field(..., min_length=1, description="Provincia dell'ufficio provinciale (ricerca)")
+    comune: str = Field(
+        ...,
+        min_length=1,
+        description="Comune (richiesto dal client; in PF può coincidere con comune catastale)",
+    )
+    pf_tipo_catasto: Optional[str] = Field(
+        None, pattern=r"^[ETF]$", description="'E' entrambi, 'T' terreni, 'F' fabbricati"
+    )
+    pf_comune_catastale: Optional[str] = None
+    pf_search_by: Optional[str] = Field("cognome", pattern=r"^(cognome|cf)$")
+    pf_cognome: Optional[str] = None
+    pf_nome: Optional[str] = None
+    pf_codice_fiscale: Optional[str] = None
+    pf_birth_day: Optional[str] = None
+    pf_birth_month: Optional[str] = None
+    pf_birth_year: Optional[str] = None
+    pf_sesso: Optional[str] = Field(None, pattern=r"^[MF]$")
+    pf_birth_province: Optional[str] = None
+    pf_tipo_ispezione: Optional[str] = Field("R", pattern=r"^[RAL]$")
+    pf_limitata: Optional[str] = Field(None, pattern=r"^[012]$")
+    tipo_richiesta: Optional[str] = Field("A", pattern=r"^[AS]$")
+    richiedente: Optional[str] = None
+    motivo: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -762,6 +970,52 @@ async def ottieni_visura(request_id: str, service: VisuraService = Depends(get_v
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/visura/persona-fisica")
+async def richiedi_visura_persona_fisica(
+    request: VisuraPersonaFisicaInput, service: VisuraService = Depends(get_visura_service)
+):
+    """Accoda una ricerca visura per persona fisica (beni catastali)."""
+    try:
+        request_id = f"req_pf_{int(time.time() * 1000)}"
+        pf_req = VisuraPersonaFisicaRequest(
+            request_id=request_id,
+            provincia=request.provincia,
+            comune=request.comune,
+            pf_tipo_catasto=request.pf_tipo_catasto,
+            pf_comune_catastale=request.pf_comune_catastale,
+            pf_search_by=request.pf_search_by or "cognome",
+            pf_cognome=request.pf_cognome,
+            pf_nome=request.pf_nome,
+            pf_codice_fiscale=request.pf_codice_fiscale,
+            pf_birth_day=request.pf_birth_day,
+            pf_birth_month=request.pf_birth_month,
+            pf_birth_year=request.pf_birth_year,
+            pf_sesso=request.pf_sesso,
+            pf_birth_province=request.pf_birth_province,
+            pf_tipo_ispezione=request.pf_tipo_ispezione or "R",
+            pf_limitata=request.pf_limitata,
+            tipo_richiesta=request.tipo_richiesta or "A",
+            richiedente=request.richiedente,
+            motivo=request.motivo,
+        )
+        await service.add_persona_fisica_request(pf_req)
+
+        return JSONResponse(
+            {
+                "request_ids": [request_id],
+                "tipos_catasto": ["PF"],
+                "status": "queued",
+                "message": f"Richiesta visura persona fisica accodata ({request_id})",
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Errore nella richiesta visura PF: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/visura/intestati")
 async def richiedi_intestati_immobile(
     request: VisuraIntestatiInput, service: VisuraService = Depends(get_visura_service)
@@ -800,6 +1054,54 @@ async def richiedi_intestati_immobile(
         raise
     except Exception as e:
         logger.error(f"Errore nella richiesta intestati: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def verify_visura_session_secret(
+    x_visura_session_secret: Optional[str] = Header(None, alias="X-Visura-Session-Secret"),
+):
+    """Se VISURA_SESSION_SECRET è impostato, richiede lo stesso valore nell'header."""
+    secret = os.getenv("VISURA_SESSION_SECRET", "").strip()
+    if not secret:
+        return True
+    if not x_visura_session_secret or x_visura_session_secret.strip() != secret:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Visura-Session-Secret")
+    return True
+
+
+@app.post("/session/login")
+async def session_login_endpoint(
+    service: VisuraService = Depends(get_visura_service),
+    _: bool = Depends(verify_visura_session_secret),
+):
+    """Esegue login esplicito (stesso flusso dell'avvio: utile per 'Connetti' da un client)."""
+    try:
+        data = await service.session_login()
+        return JSONResponse(
+            {
+                **data,
+                "authenticated": service.browser_manager.authenticated,
+            }
+        )
+    except AuthenticationError as e:
+        logger.error(f"session/login fallito: {e}")
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        logger.error(f"Errore session/login: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/session/logout")
+async def session_logout_endpoint(
+    service: VisuraService = Depends(get_visura_service),
+    _: bool = Depends(verify_visura_session_secret),
+):
+    """Logout sul portale ADE/SISTER senza spegnere il processo (preferibile a /shutdown)."""
+    try:
+        data = await service.session_logout()
+        return JSONResponse(data)
+    except Exception as e:
+        logger.error(f"Errore session/logout: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
