@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import time
@@ -7,6 +8,8 @@ from typing import Optional
 from bs4 import BeautifulSoup
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+_log = logging.getLogger(__name__)
 
 DEFAULT_PAGES_LOG_DIR = "./logs/pages"
 FALLBACK_PAGES_LOG_DIR = "/tmp/visura-api/logs/pages"
@@ -205,6 +208,37 @@ def _sister_login_confirmed(url: str, body: str) -> bool:
     return False
 
 
+async def _sister_route_skip_heavy_assets(route) -> None:
+    """Riduce memoria CPU su ambienti con poca RAM (es. container Render)."""
+    try:
+        if route.request.resource_type in ("image", "media"):
+            await route.abort()
+        else:
+            await route.continue_()
+    except Exception:
+        try:
+            await route.continue_()
+        except Exception:
+            pass
+
+
+async def _sister_try_fill(page: Page, selector: str, text: str, *, timeout_ms: int) -> bool:
+    loc = page.locator(selector).first
+    if not await loc.count():
+        return False
+    try:
+        await loc.scroll_into_view_if_needed(timeout=min(12000, timeout_ms))
+        await loc.wait_for(state="visible", timeout=min(12000, timeout_ms))
+        await loc.fill(text, timeout=timeout_ms)
+        return True
+    except PlaywrightTimeoutError:
+        _log.warning("login_sister_tab: timeout su fill %s", selector)
+        return False
+    except Exception as e:
+        _log.warning("login_sister_tab: fill fallito %s: %s", selector, e)
+        return False
+
+
 async def login_sister_tab(page: Page):
     """Login tramite tab SISTER (username/password), senza flusso SPID/CIE."""
     ade_username = os.getenv("ADE_USERNAME")
@@ -217,10 +251,20 @@ async def login_sister_tab(page: Page):
     if not ade_username or not ade_password:
         raise ValueError("ADE_USERNAME and ADE_PASSWORD environment variables must be set")
 
+    ade_username = ade_username.strip()
+    ade_password = ade_password.strip()
+
+    fill_timeout_ms = int(os.getenv("SISTER_LOGIN_FILL_TIMEOUT_MS", "25000"))
+
     logger = PageLogger("login_sister_tab")
     step = "goto_login"
     try:
-        print("[LOGIN_SISTER] Navigo alla pagina di login...")
+        try:
+            await page.route("**/*", _sister_route_skip_heavy_assets)
+        except Exception as e:
+            _log.warning("login_sister_tab: impossibile registrare route asset leggeri: %s", e)
+
+        print("[LOGIN_SISTER] Navigo alla pagina di login...", flush=True)
         await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
         await logger.log(page, step)
 
@@ -256,61 +300,61 @@ async def login_sister_tab(page: Page):
             await page.locator("#username-sister").wait_for(state="visible", timeout=20000)
         except Exception:
             await logger.log(page, f"wait_{step}")
-        print("[LOGIN_SISTER] Inserisco credenziali...")
-        filled = False
-        for selector in (
+
+        print("[LOGIN_SISTER] Inserisco credenziali...", flush=True)
+        _log.info("login_sister_tab: compilazione campi (fill_timeout_ms=%s)", fill_timeout_ms)
+
+        username_selectors = (
             "#username-sister",
             "#tab-5 input#username-sister",
             '#tab-5 input[name="IDToken1"]',
             'input[id="username-sister"]',
-            'input[name="IDToken1"]',
+            # Mai il primo IDToken1 globale: è il campo Fisconline nel DOM.
             'input[name="username"]',
             'input[name="user"]',
             'input[autocomplete="username"]',
-        ):
-            loc = page.locator(selector).first
-            if await loc.count():
-                try:
-                    await loc.wait_for(state="visible", timeout=5000)
-                except Exception:
-                    continue
-                await loc.fill(ade_username)
+        )
+        filled = False
+        for selector in username_selectors:
+            if await _sister_try_fill(page, selector, ade_username, timeout_ms=fill_timeout_ms):
                 filled = True
+                _log.info("login_sister_tab: username compilato (%s)", selector)
                 break
         if not filled:
             try:
-                await sister_pane.get_by_label(re.compile(r"utente", re.I)).first.fill(ade_username)
+                ul = sister_pane.get_by_label(re.compile(r"utente", re.I)).first
+                await ul.scroll_into_view_if_needed(timeout=8000)
+                await ul.fill(ade_username, timeout=fill_timeout_ms)
                 filled = True
-            except Exception:
-                pass
+                _log.info("login_sister_tab: username via label Utente")
+            except Exception as e:
+                _log.warning("login_sister_tab: label Utente fallita: %s", e)
         if not filled:
             try:
-                await page.get_by_label(re.compile(r"username|utente|codice", re.I)).first.fill(ade_username)
+                ul = page.get_by_label(re.compile(r"username|utente|codice", re.I)).first
+                await ul.fill(ade_username, timeout=fill_timeout_ms)
                 filled = True
-            except Exception:
-                pass
+            except Exception as e:
+                _log.warning("login_sister_tab: label generica fallita: %s", e)
         if not filled:
             raise Exception("Campo username SISTER non trovato")
 
         step = "password"
-        pw = None
-        for selector in (
+        print("[LOGIN_SISTER] Campo password...", flush=True)
+        password_selectors = (
             "#password-fo-sist",
             "#tab-5 input#password-fo-sist",
             '#tab-5 input[name="IDToken2"]',
             "#tab-5 input[type='password']",
-        ):
-            cand = page.locator(selector).first
-            if await cand.count():
-                try:
-                    await cand.wait_for(state="visible", timeout=5000)
-                except Exception:
-                    continue
-                pw = cand
+        )
+        filled_pw = False
+        for selector in password_selectors:
+            if await _sister_try_fill(page, selector, ade_password, timeout_ms=fill_timeout_ms):
+                filled_pw = True
+                _log.info("login_sister_tab: password compilata (%s)", selector)
                 break
-        if pw is None:
+        if not filled_pw:
             raise Exception("Campo password SISTER non trovato")
-        await pw.fill(ade_password)
 
         step = "submit"
         clicked = False
@@ -327,7 +371,7 @@ async def login_sister_tab(page: Page):
                     await btn.wait_for(state="visible", timeout=3000)
                 except Exception:
                     continue
-                await btn.click()
+                await btn.click(timeout=fill_timeout_ms)
                 clicked = True
                 break
         if not clicked:
@@ -337,14 +381,14 @@ async def login_sister_tab(page: Page):
             ):
                 btn = sister_pane.locator(selector).first
                 if await btn.count() and await btn.is_visible():
-                    await btn.click()
+                    await btn.click(timeout=fill_timeout_ms)
                     clicked = True
                     break
         if not clicked:
             for name in ("Accedi", "Entra", "Login", "Continua", "Prosegui"):
                 b = sister_pane.get_by_role("button", name=re.compile(name, re.I)).first
                 if await b.count() and await b.is_visible():
-                    await b.click()
+                    await b.click(timeout=fill_timeout_ms)
                     clicked = True
                     break
         if not clicked:
@@ -382,14 +426,14 @@ async def login_sister_tab(page: Page):
                     "Login SISTER rifiutato dalla pagina IAM (credenziali errate o messaggio di errore visibile)."
                 )
             if _sister_login_confirmed(url, body):
-                print("[LOGIN_SISTER] Sessione confermata.")
+                print("[LOGIN_SISTER] Sessione confermata.", flush=True)
                 return
             await page.wait_for_timeout(interval_ms)
 
         url_final = page.url
         body_final = (await page.content()).lower()
         if _sister_login_confirmed(url_final, body_final):
-            print("[LOGIN_SISTER] Sessione confermata (ultimo controllo).")
+            print("[LOGIN_SISTER] Sessione confermata (ultimo controllo).", flush=True)
             return
         hint = url_final[:200] if len(url_final) > 200 else url_final
         raise Exception(
@@ -399,7 +443,18 @@ async def login_sister_tab(page: Page):
         )
 
     except Exception:
-        await logger.log(page, f"ERRORE_{step}")
+        try:
+            _log.exception(
+                "login_sister_tab: errore nello step %s (url=%s)",
+                step,
+                getattr(page, "url", "")[:300],
+            )
+        except Exception:
+            pass
+        try:
+            await logger.log(page, f"ERRORE_{step}")
+        except Exception as log_err:
+            _log.warning("login_sister_tab: PageLogger fallito: %s", log_err)
         raise
 
 
